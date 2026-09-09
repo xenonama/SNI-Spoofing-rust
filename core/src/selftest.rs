@@ -12,12 +12,8 @@
 
 use std::path::Path;
 
-fn err(s: impl Into<String>) -> String {
-    s.into()
-}
-
 fn check_config(path: &Path) -> Result<String, String> {
-    let cfg = crate::config::load(path).map_err(|e| err(e.to_string()))?;
+    let cfg = crate::config::load(path).map_err(|e| e.to_string())?;
     Ok(format!(
         "{} endpoint(s), {} SNI(s), method={}",
         cfg.endpoints.len(),
@@ -31,7 +27,7 @@ fn check_packet_template() -> Result<String, String> {
     let sess = [0x22u8; 32];
     let key = [0x33u8; 32];
     let hello = crate::tls::get_client_hello_with(&rnd, &sess, b"example.com", &key)
-        .map_err(err)?;
+        .map_err(|e| e.to_string())?;
     if hello.len() != 517 {
         return Err(format!("ClientHello len {} != 517", hello.len()));
     }
@@ -99,7 +95,7 @@ fn check_tlsfp() -> Result<String, String> {
     }
     // All profile names parse (modern dispatch to legacy documented).
     for name in ["legacy", "chrome_120", "chrome_124", "firefox_122", "firefox_124", "custom"] {
-        crate::tls::TlsProfile::parse(name).map_err(err)?;
+        crate::tls::TlsProfile::parse(name).map_err(|e| e.to_string())?;
     }
     if crate::tls::TlsProfile::parse("bogus").is_ok() {
         return Err("bogus profile should fail".to_string());
@@ -120,7 +116,7 @@ fn check_quic() -> Result<String, String> {
         ("spoof", crate::quic::QuicMode::Spoof),
         ("passthrough", crate::quic::QuicMode::Passthrough),
     ] {
-        let m = crate::quic::QuicMode::parse(name).map_err(err)?;
+        let m = crate::quic::QuicMode::parse(name).map_err(|e| e.to_string())?;
         if m != expect {
             return Err(format!("quic mode {} mismatch", name));
         }
@@ -136,17 +132,17 @@ fn check_quic() -> Result<String, String> {
 }
 
 fn check_new_methods() -> Result<String, String> {
-    if crate::fake_tcp::resolve_method("hostfakesplit").map_err(err)? != crate::fake_tcp::BypassMethod::HostFakeSplit {
+    if crate::fake_tcp::resolve_method("hostfakesplit").map_err(|e| e.to_string())? != crate::fake_tcp::BypassMethod::HostFakeSplit {
         return Err("resolve hostfakesplit failed".to_string());
     }
-    if crate::fake_tcp::resolve_method("fakedsplit").map_err(err)? != crate::fake_tcp::BypassMethod::FakeSplit {
+    if crate::fake_tcp::resolve_method("fakedsplit").map_err(|e| e.to_string())? != crate::fake_tcp::BypassMethod::FakeSplit {
         return Err("resolve fakedsplit failed".to_string());
     }
-    let auto = crate::fake_tcp::resolve_method("auto").map_err(err)?;
+    let auto = crate::fake_tcp::resolve_method("auto").map_err(|e| e.to_string())?;
     if !crate::fake_tcp::REAL_METHODS.contains(&auto.as_str()) {
         return Err("auto did not resolve to real method".to_string());
     }
-    if crate::fake_tcp::resolve_method("split_seq").map_err(err)? != crate::fake_tcp::BypassMethod::SplitSeq {
+    if crate::fake_tcp::resolve_method("split_seq").map_err(|e| e.to_string())? != crate::fake_tcp::BypassMethod::SplitSeq {
         return Err("resolve split_seq failed".to_string());
     }
     // SNI helpers on a real legacy hello.
@@ -248,7 +244,7 @@ fn check_mock_bypass() -> Result<String, String> {
 }
 
 fn check_mode_quic(path: &Path) -> Result<String, String> {
-    let cfg = crate::config::load(path).map_err(|e| err(e.to_string()))?;
+    let cfg = crate::config::load(path).map_err(|e| e.to_string())?;
     if cfg.mode != "SNI Only" && cfg.mode != "Trojan + Xray" {
         return Err(format!("MODE {:?} unexpected", cfg.mode));
     }

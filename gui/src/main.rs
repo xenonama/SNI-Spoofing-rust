@@ -10,6 +10,7 @@ mod probe;
 
 use backend::{atomic_write_json, BackendManager, GuiEvent};
 use eframe::egui;
+use tracing_subscriber::EnvFilter;
 use probe::{probe_endpoints, probe_relay, ProbeResult};
 use sni_core::stats::Snapshot;
 use std::{sync::mpsc::Receiver, time::Duration};
@@ -167,13 +168,16 @@ impl SpooferApp {
             self.on_event(ev);
         }
         // Channel drain (try_recv loop, bounded per frame).
-        if let Some(rx) = self.rx.as_ref() {
+        // Fix #7: `take()` the receiver so `on_event(&mut self)` below does
+        // not collide with an `as_ref()` borrow; restore it afterwards.
+        if let Some(rx) = self.rx.take() {
             for _ in 0..64 {
                 match rx.try_recv() {
                     Ok(ev) => self.on_event(ev),
                     Err(_) => break,
                 }
             }
+            self.rx = Some(rx);
         }
     }
 
@@ -521,7 +525,7 @@ impl eframe::App for SpooferApp {
 
 fn main() -> eframe::Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter("warn")
+        .with_env_filter(EnvFilter::new("warn"))
         .with_target(false)
         .compact()
         .init();
@@ -529,6 +533,6 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "SNI Spoofer",
         options,
-        Box::new(|_cc| Box::new(SpooferApp::new()) as Box<dyn eframe::App>),
+        Box::new(|_cc| Ok(Box::new(SpooferApp::new()) as Box<dyn eframe::App>)),
     )
 }

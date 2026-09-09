@@ -250,7 +250,7 @@ impl Worker {
 
         // Handshake wait (mirrors `wait_for(t2a_event.wait(), TIMEOUT)`).
         let timeout = Duration::from_secs_f64(self.config.handshake_timeout.clamp(0.5, 10.0));
-        let ok = match tokio::time::timeout(entry.wait(), timeout).await {
+        let ok = match tokio::time::timeout(timeout, entry.wait()).await {
             Ok(Some(true)) => true,
             Ok(Some(false)) => false,
             Ok(None) => false,

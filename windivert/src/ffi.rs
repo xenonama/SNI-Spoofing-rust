@@ -10,8 +10,6 @@
 //!   access-denied/Admin, missing DLL) mirroring `gui.py` +
 //!   `main.py::_windivert_hint`.
 
-use crate::WindivertError;
-
 #[cfg(windows)]
 pub use inner::*;
 
@@ -21,9 +19,12 @@ mod inner {
     use std::ffi::{c_char, c_void, CStr, CString};
     use std::os::raw::{c_int, c_ushort};
     use windows::core::PCSTR;
-    use windows::Win32::Foundation::{GetLastError, HANDLE, INVALID_HANDLE_VALUE};
+    // Fix #1: HMODULE + INVALID_HANDLE_VALUE come from Foundation, not
+    // LibraryLoader. (FreeLibrary/LoadLibraryW/GetProcAddress genuinely live
+    // in LibraryLoader in windows 0.58 — there is no Foundation::FreeLibrary,
+    // so those stay. See Phase 1 migration notes.)
+    use windows::Win32::Foundation::{GetLastError, HANDLE, HMODULE, INVALID_HANDLE_VALUE};
     use windows::Win32::System::LibraryLoader::{FreeLibrary, GetProcAddress, LoadLibraryW};
-    use windows::Win32::System::LibraryLoader::HMODULE;
 
     /// WinDivert network layer (we intercept at NETWORK, like pydivert default).
     pub const WINDIVERT_LAYER_NETWORK: c_int = 0;
@@ -160,12 +161,11 @@ mod inner {
             let c = CString::new(filter).map_err(|_| WindivertError::EmptyFilter)?;
             // SAFETY: `c` outlives the call; WinDivert copies the filter string.
             let h = unsafe { (self.open)(c.as_ptr(), WINDIVERT_LAYER_NETWORK, priority, flags) };
+            // Fix #1: single canonical validity check. WinDivertOpen signals
+            // failure with INVALID_HANDLE_VALUE; HANDLE has PartialEq, so no
+            // raw `.0 == 0` field comparison (which is both non-idiomatic and
+            // wrong — NULL and INVALID_HANDLE_VALUE are distinct sentinels).
             if h == INVALID_HANDLE_VALUE {
-                let code = unsafe { GetLastError().0 };
-                return Err(WindivertError::OpenFailed(open_error_hint(code)));
-            }
-            // Extra guard: HANDLE(0)/null is never valid from WinDivertOpen.
-            if h.0 == 0 {
                 let code = unsafe { GetLastError().0 };
                 return Err(WindivertError::OpenFailed(open_error_hint(code)));
             }

@@ -12,7 +12,7 @@ use std::{
     io::{BufRead, BufReader},
     path::PathBuf,
     process::{Child, Command, Stdio},
-    sync::mpsc::{self, Receiver, Sender},
+    sync::mpsc::{self, Receiver},
     thread::JoinHandle,
 };
 
@@ -145,6 +145,9 @@ impl BackendManager {
                 }
                 // Waiter: report exit so the GUI can auto-restart or toast.
                 let txw = tx_clone;
+                // Fix #6: clone `path` — the `move` closure below would
+                // otherwise move it and break the `spawned ...` log line.
+                let path_for_waiter = path.clone();
                 self._pumps.push(
                     std::thread::Builder::new()
                         .name("backend-wait".into())
@@ -155,7 +158,7 @@ impl BackendManager {
                             // exists to keep pump handles grouped.
                             let _ = txw.send(GuiEvent::Log(format!(
                                 "backend started: {}",
-                                path.display()
+                                path_for_waiter.display()
                             )));
                         })
                         .unwrap(),

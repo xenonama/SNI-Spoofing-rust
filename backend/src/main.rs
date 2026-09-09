@@ -8,6 +8,7 @@ mod worker;
 
 use clap::Parser;
 use std::{path::PathBuf, sync::Arc, time::Duration};
+use tracing_subscriber::EnvFilter;
 use worker::Worker;
 
 /// Mirrors `main.py::parse_args`.
@@ -75,7 +76,10 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
     tracing_subscriber::fmt()
-        .with_env_filter(format!("warn,sni_backend={}", args.log_level.to_lowercase()))
+        .with_env_filter(EnvFilter::new(format!(
+            "warn,sni_backend={}",
+            args.log_level.to_lowercase()
+        )))
         .with_target(false)
         .compact()
         .init();
