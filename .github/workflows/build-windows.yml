@@ -26,9 +26,32 @@ jobs:
         working-directory: gui
         run: npm install
 
-      - name: Generate icons
+      - name: Generate default icon (no source needed)
         working-directory: gui
-        run: npx tauri icon icons/source.png -o icons
+        shell: pwsh
+        run: |
+          # Default icon: solid #00B4D8 (accent color) with "SNI" text.
+          # Uses .NET System.Drawing so no extra tools are required on the runner.
+          Add-Type -AssemblyName System.Drawing
+          $bmp = New-Object System.Drawing.Bitmap 1024, 1024
+          $g = [System.Drawing.Graphics]::FromImage($bmp)
+          $g.SmoothingMode = 'AntiAlias'
+          $g.TextRenderingHint = 'AntiAliasGridFit'
+          $g.Clear([System.Drawing.Color]::FromArgb(0, 180, 216))
+          $font = New-Object System.Drawing.Font('Segoe UI', 400, [System.Drawing.FontStyle]::Bold)
+          $brush = [System.Drawing.Brushes]::White
+          $fmt = New-Object System.Drawing.StringFormat
+          $fmt.Alignment = 'Center'
+          $fmt.LineAlignment = 'Center'
+          $rect = New-Object System.Drawing.RectangleF 0, 0, 1024, 1024
+          $g.DrawString('SNI', $font, $brush, $rect, $fmt)
+          $g.Dispose()
+          $bmp.Save("$pwd\default-icon.png", [System.Drawing.Imaging.ImageFormat]::Png)
+          $bmp.Dispose()
+
+      - name: Build icons into gui/icons/
+        working-directory: gui
+        run: npx tauri icon default-icon.png -o icons
 
       - name: Build Tauri app
         working-directory: gui
