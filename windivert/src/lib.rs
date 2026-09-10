@@ -58,6 +58,26 @@ impl Packet {
         }
     }
 
+    /// Raw packet bytes (IPv4 + TCP/UDP).
+    pub fn bytes(&self) -> &[u8] {
+        &self.raw
+    }
+
+    /// Clone this packet with replaced raw bytes, preserving direction and
+    /// the WinDivert address (interface/loopback/impostor bits).
+    ///
+    /// Needed by the unified GUI's DPI dispatch (`engine.rs`): fake segments
+    /// built with `sni_core::tcp::build_fake_tcp` must be reinjected with the
+    /// *original* packet's address, which lives in `pub(crate) addr` and is
+    /// otherwise unreachable from downstream crates.
+    pub fn with_raw(&self, raw: Vec<u8>) -> Self {
+        Self {
+            direction: self.direction,
+            raw: BytesMut::from(&raw[..]),
+            addr: self.addr,
+        }
+    }
+
     pub fn is_inbound(&self) -> bool {
         self.direction == Direction::Inbound
     }

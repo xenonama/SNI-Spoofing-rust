@@ -51,7 +51,7 @@ fn acquire_single_instance(port: u16) -> anyhow::Result<()> {
     let name = format!("SNI-Spoofer-Backend-{}\0", port);
     let wide: Vec<u16> = name.encode_utf16().collect();
     // SAFETY: `wide` outlives the call; WinDivert-style FFI, string copied by OS.
-    let res = unsafe { CreateMutexW(None, true.into(), PCWSTR(wide.as_ptr())) };
+    let res = unsafe { CreateMutexW(None, true, PCWSTR(wide.as_ptr())) };
     match res {
         Ok(handle) => {
             // ERROR_ALREADY_EXISTS means another backend holds the mutex.
