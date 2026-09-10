@@ -30,8 +30,6 @@ jobs:
         working-directory: gui
         shell: pwsh
         run: |
-          # Default icon: solid #00B4D8 (accent color) with "SNI" text.
-          # Uses .NET System.Drawing so no extra tools are required on the runner.
           Add-Type -AssemblyName System.Drawing
           $bmp = New-Object System.Drawing.Bitmap 1024, 1024
           $g = [System.Drawing.Graphics]::FromImage($bmp)
@@ -57,8 +55,44 @@ jobs:
         working-directory: gui
         run: npm run tauri build
 
-      - name: Upload .exe artifact
+      - name: Find and stage artifacts
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path "artifacts" | Out-Null
+
+          $exe = Get-ChildItem -Path "gui" -Filter "sni-gui.exe" -Recurse -ErrorAction SilentlyContinue |
+                 Where-Object { $_.FullName -like "*release*" } |
+                 Select-Object -First 1
+          if ($exe) {
+            Write-Host "Found exe: $($exe.FullName)"
+            Copy-Item $exe.FullName -Destination "artifacts/sni-gui.exe"
+          } else {
+            Write-Host "ERROR: sni-gui.exe not found anywhere under gui/"
+            exit 1
+          }
+
+          $nsis = Get-ChildItem -Path "gui" -Filter "*.exe" -Recurse -ErrorAction SilentlyContinue |
+                  Where-Object { $_.FullName -like "*bundle*nsis*" } |
+                  Select-Object -First 1
+          if ($nsis) {
+            Write-Host "Found NSIS installer: $($nsis.FullName)"
+            Copy-Item $nsis.FullName -Destination "artifacts/"
+          }
+
+          $msi = Get-ChildItem -Path "gui" -Filter "*.msi" -Recurse -ErrorAction SilentlyContinue |
+                 Where-Object { $_.FullName -like "*bundle*msi*" } |
+                 Select-Object -First 1
+          if ($msi) {
+            Write-Host "Found MSI installer: $($msi.FullName)"
+            Copy-Item $msi.FullName -Destination "artifacts/"
+          }
+
+          Write-Host "--- Staged artifacts ---"
+          Get-ChildItem artifacts/ | Format-Table Name, Length
+
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: sni-gui-windows
-          path: gui/src-tauri/target/release/sni-gui.exe
+          path: artifacts/
+          if-no-files-found: error
