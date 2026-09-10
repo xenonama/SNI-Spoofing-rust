@@ -2,24 +2,35 @@
 name = "sni-gui"
 version = "2.0.0"
 edition = "2021"
-description = "Unified single-executable: eframe GUI + in-process Tokio relay and WinDivert DPI dispatch (no child process)."
+description = "SNI Spoofer — Tauri GUI + Rust engine"
 
 [[bin]]
 name = "sni-gui"
-path = "src/main.rs"
+path = "src-tauri/src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
 
 [dependencies]
 sni-core = { path = "../core" }
 sni-windivert = { path = "../windivert" }
 tokio = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
-clap = { workspace = true }
 parking_lot = { workspace = true }
-eframe = { workspace = true }
-egui = { workspace = true }
+tauri = { version = "2", features = [] }
+tauri-plugin-shell = "2"
 
 [target.'cfg(windows)'.dependencies]
-windows = { version = "0.58", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_Security", "Win32_System_Console"] }
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+    "Win32_Security",
+    "Win32_System_Console",
+] }
+
+[features]
+custom-protocol = ["tauri/custom-protocol"]

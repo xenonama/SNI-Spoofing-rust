@@ -17,6 +17,8 @@ use std::sync::Arc;
 use windows::Win32::Foundation::HANDLE;
 
 const RECV_BUF: usize = 65575; // mirrors `w.recv(65575)` in injecter.py
+// FIX(D): 10ms error backoff (spec); yield_now() avoids busy-wait while
+// keeping capture latency low.
 const RETRY_DELAY_MS: u64 = 10;
 
 /// Shared ownership of the driver resources so `stop()` can be called from
@@ -149,13 +151,19 @@ impl WindivertHandle {
         tracing::info!(filter = %self.filter(), "capture loop started");
         while !self.is_stopped() {
             match self.recv() {
-                Ok(pkt) => inject(pkt),
+                // FIX(D): yield after each inject() so the capture thread
+                // never starves the Tokio workers on a busy link.
+                Ok(pkt) => {
+                    inject(pkt);
+                    std::thread::yield_now();
+                }
                 Err(e) => {
                     if self.is_stopped() {
                         break;
                     }
                     tracing::debug!("recv error (surviving): {}", e);
                     std::thread::sleep(std::time::Duration::from_millis(RETRY_DELAY_MS));
+                    std::thread::yield_now();
                     continue;
                 }
             }

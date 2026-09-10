@@ -19,5 +19,5 @@ md5 = "0.7"
 parking_lot = "0.12"
 eframe = "0.28"
 egui = "0.28"
-# Features are set per-crate (sni-gui needs Win32_Security for CreateMutexW).
+# Features are set per-crate (backend needs Win32_Security for CreateMutexW).
 windows = { version = "0.58" }
