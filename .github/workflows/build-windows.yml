@@ -26,6 +26,10 @@ jobs:
         working-directory: gui
         run: npm install
 
+      - name: Generate icons
+        working-directory: gui
+        run: npx tauri icon icons/source.png -o icons
+
       - name: Build Tauri app
         working-directory: gui
         run: npm run tauri build
