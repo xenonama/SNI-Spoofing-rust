@@ -16,6 +16,7 @@
 mod engine;
 mod probe;
 mod state;
+mod worker;
 
 use engine::EngineHandle;
 use sni_core::{
