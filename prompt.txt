@@ -1,0 +1,177 @@
+FIX THREE UI/UX BUGS — Wails v3 SNI-Spoofer
+No new features. Only fix these three specific issues.
+
+================================================================
+BUG 1 — UPTIME TIMER STARTS AT APP LAUNCH
+================================================================
+
+SYMPTOM:
+The header timer (e.g., "00:08:52") counts from the moment the window
+opens, not from engine Start. Even when the status shows "IDLE" and
+no engine is running, the timer advances.
+
+REQUIRED BEHAVIOR:
+  - While engine is stopped: display "--:--:--" (literally).
+  - On Start: begin counting from 00:00:00.
+  - On Stop: reset to "--:--:--".
+  - On page reload / fresh launch: "--:--:--" until first Start.
+
+ROOT CAUSE (verify in code):
+Uptime is likely derived from a module-level constant captured at
+first render (e.g., `const APP_START = Date.now()`), or from a
+component-mount timestamp, or from a `useEffect` that sets
+`startedAt` once on mount.
+
+REQUIRED FIX:
+1. In frontend/src/stores/appStore.ts:
+   - Add field: `engineStartedAt: number | null` (default null).
+   - In `start()` action: after `await api.startEngine(cfg)` succeeds,
+     set `engineStartedAt: Date.now()`.
+   - In `stop()` action: set `engineStartedAt: null`.
+   - Remove any other timestamp field (e.g., `appStartedAt`,
+     `mountTime`, `sessionStart`) if it exists and feeds uptime.
+
+2. In frontend/src/components/Header.tsx:
+   - Uptime must be computed ONLY from `engineStartedAt`:
+       const uptime = engineStartedAt
+         ? formatDuration(Date.now() - engineStartedAt)
+         : "--:--:--";
+   - The 1Hz tick that refreshes uptime must ONLY run while
+     `engineStartedAt !== null`. When null, no interval, no repaint.
+   - When engine transitions from running to stopped, uptime must
+     immediately reset to "--:--:--" (not linger at the last value).
+
+3. Verify in App.tsx:
+   - The 1Hz setInterval must NOT drive uptime. It only polls stats.
+   - Uptime is a separate concern.
+
+================================================================
+BUG 2 — DISABLE RIGHT-CLICK CONTEXT MENU
+================================================================
+
+SYMPTOM:
+Right-clicking anywhere in the app shows the WebView2 default menu:
+"Save as", "Inspect", "Print", "Reload", etc. This is inappropriate
+for a desktop app and exposes developer tools to end users.
+
+REQUIRED FIX:
+Disable the WebView2 context menu AND common developer shortcuts.
+
+1. In frontend/src/main.tsx (or a new file frontend/src/disable-dev.ts
+   imported from main.tsx):
+   - Block the contextmenu event:
+       document.addEventListener('contextmenu', (e) => e.preventDefault());
+   - Block developer keyboard shortcuts (F12, Ctrl+Shift+I, Ctrl+Shift+J,
+     Ctrl+Shift+C, Ctrl+U, Ctrl+P):
+       document.addEventListener('keydown', (e) => {
+         if (
+           e.key === 'F12' ||
+           (e.ctrlKey && e.shiftKey && ['I','J','C'].includes(e.key)) ||
+           (e.ctrlKey && ['U','P'].includes(e.key))
+         ) {
+           e.preventDefault();
+         }
+       });
+
+2. In Wails v3 Go config (gui/main.go or wherever application.Options
+   is set), check if there is an option to disable the WebView2
+   context menu natively. Wails v3 exposes WebviewWindowOptions with
+   fields like `DisableDefaultContextMenu` (or similar). If it exists,
+   set it to true. If not, rely on the JS solution above.
+
+3. Do NOT disable F5 (refresh) — useful during development. This can
+   be conditional on `import.meta.env.DEV`:
+       if (!import.meta.env.DEV) {
+         // block F5 and Ctrl+R in production
+       }
+
+================================================================
+BUG 3 — CUSTOM TITLE BAR (VS Code / Firefox style)
+================================================================
+
+SYMPTOM:
+The window uses the default Windows title bar (gray, with system
+minimize/maximize/close buttons). The user wants a custom, integrated
+title bar like VS Code or Firefox: seamless with the app's dark theme,
+custom window controls on the right, and a draggable region.
+
+REQUIRED BEHAVIOR:
+1. Remove the OS-provided title bar (frameless window).
+2. Draw our own title bar inside the app:
+   - Height: 32–36px.
+   - Background matches Theme.bg (#0A0C10) or Theme.surface (#12161D).
+   - Left side: app icon + "SNI Spoofer" (small, muted) — OPTIONAL,
+     the existing in-app header already shows the brand. A minimal
+     32px strip is fine.
+   - Right side: three custom buttons:
+       - Minimize (—)
+       - Maximize / Restore (□ / ❐)
+       - Close (✕) — red on hover
+   - Middle: draggable region (--wails-draggable: drag).
+
+3. Wire the buttons to Wails runtime:
+   - Import from "@wailsio/runtime": Window
+   - Minimize: Window.Minimise()
+   - Maximize/Restore: toggle between Window.Maximise() and
+     Window.UnMaximise() (track a boolean for current state)
+   - Close: Window.Close()
+
+4. Configure the window as frameless in gui/main.go:
+   application.WebviewWindowOptions{
+     ...
+     Frameless: true,
+     // Also check for MinWidth/MinHeight to preserve resize limits.
+   }
+
+5. On Windows, ensure the frameless window can still be:
+   - Resized from edges (Wails v3 handles this automatically when
+     Frameless: true, but VERIFY in docs).
+   - Dragged from the custom title bar (needs the
+     --wails-draggable: drag CSS on the drag region).
+   - Double-clicked on the drag region to maximize/restore.
+
+6. Update the existing Header component:
+   - Either integrate the custom title bar INTO the existing header
+     (making it ~64px total with the drag region on the empty middle
+     part), OR
+   - Add a separate 32px TitleBar component above the existing Header.
+   - The user prefers the integrated look (like Firefox). Choose that.
+
+IMPLEMENTATION NOTES:
+- Wails v3 exposes the window at runtime via:
+    import { Window } from "@wailsio/runtime";
+- The frameless window will lose the OS snap-to-edge gestures on
+  Windows unless Wails handles them. If snap is important, keep
+  the native frame. Otherwise proceed with frameless.
+- The drag region MUST NOT cover interactive elements (buttons,
+  inputs). Use `--wails-draggable: no-drag` on those (or simply do
+  not place them inside the drag region).
+
+================================================================
+DELIVERABLES
+================================================================
+
+Provide the FULL corrected content of:
+  1. frontend/src/stores/appStore.ts
+  2. frontend/src/components/Header.tsx
+  3. frontend/src/main.tsx
+  4. frontend/src/components/TitleBar.tsx     (NEW if not exists)
+  5. frontend/src/App.tsx                     (to include TitleBar)
+  6. gui/main.go                              (Frameless: true)
+  7. frontend/src/index.css                   (drag-region helpers)
+
+Every change must carry a `// FIX:` comment explaining why.
+
+================================================================
+CONSTRAINTS
+================================================================
+- No new npm dependencies.
+- No new Go dependencies.
+- Preserve all existing features.
+- Windows compatibility preserved.
+- ZERO new warnings.
+
+================================================================
+RED FLAG
+================================================================
+Do NOT install anything. Do NOT run cargo/go/npm. Only provide source.
