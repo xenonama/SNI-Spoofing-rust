@@ -117,6 +117,14 @@ impl Stats {
         self.inner.lock().failed += 1;
     }
 
+    /// Bump the success counter without touching `active`.
+    /// FIX(stats): used by the relay-outcome accounting path so the
+    /// worker can decide success/fail AFTER the relay ends, without
+    /// the decrement-active side effect of `finish_success()`.
+    pub fn increment_success(&self) {
+        self.inner.lock().success += 1;
+    }
+
     /// Release one active slot without counting success/fail (relay teardown).
     /// Phase 3 needs this so handshake success isn't double-counted.
     pub fn decrement_active(&self) {

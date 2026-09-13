@@ -61,23 +61,31 @@ pub fn ep_key(ep: &Endpoint) -> String {
 
 /// TCP filter covering ALL endpoints (both directions).
 /// Mirrors `main.py` filt construction exactly.
+/// FIX P3/P4: scope to the endpoint ports so non-handshake traffic (80/8080/
+/// probe/relay data) doesn't hit DPI; guard empty to avoid `tcp and ()`
+/// syntax error.
 pub fn build_tcp_filter(interface_ipv4: &str, endpoints: &[Endpoint]) -> String {
+    if endpoints.is_empty() {
+        return "tcp and false".to_string();
+    }
     let parts: Vec<String> = endpoints
         .iter()
         .map(|e| {
             format!(
-                "(ip.SrcAddr == {} and ip.DstAddr == {}) or (ip.SrcAddr == {} and ip.DstAddr == {})",
-                interface_ipv4, e.ip, e.ip, interface_ipv4
+                "((ip.SrcAddr == {} and ip.DstAddr == {} and tcp.DstPort == {}) or (ip.SrcAddr == {} and ip.DstAddr == {} and tcp.SrcPort == {}))",
+                interface_ipv4, e.ip, e.port, e.ip, interface_ipv4, e.port
             )
         })
         .collect();
     format!("tcp and ({})", parts.join(" or "))
 }
 
-/// Narrow UDP/443 filter around the interface IP. Mirrors `quic_filt`.
+/// Narrow UDP filter around the interface IP. Mirrors `quic_filt`.
+/// FIX P3: cover common QUIC ports (443/80/8443), not just 443, so block
+/// can't be bypassed by Alt-Svc on a non-443 port.
 pub fn build_quic_filter(interface_ipv4: &str) -> String {
     format!(
-        "udp and ((ip.SrcAddr == {} and udp.DstPort == 443) or (udp.SrcPort == 443 and ip.DstAddr == {}))",
+        "udp and ((ip.SrcAddr == {} and (udp.DstPort == 443 or udp.DstPort == 80 or udp.DstPort == 8443)) or ((udp.SrcPort == 443 or udp.SrcPort == 80 or udp.SrcPort == 8443) and ip.DstAddr == {}))",
         interface_ipv4, interface_ipv4
     )
 }

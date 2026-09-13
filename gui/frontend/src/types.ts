@@ -19,8 +19,8 @@ export interface AppConfig {
   MODE: string;
   PROBE_TRIES: number;
   PROBE_TIMEOUT: number;
-  SOCKS5_PORT: number;
-  HTTP_PORT: number;
+  // FIX(#1c): SOCKS5_PORT/HTTP_PORT removed. Engine is raw TCP; Xray owns
+  // those listeners. Rust Config still accepts them on load for compat.
   // Lowercase aliases accepted by the Rust migrate() layer.
   listen_host?: string;
   listen_port?: number;
@@ -121,8 +121,7 @@ export function defaultConfig(): AppConfig {
     MODE: "SNI Only",
     PROBE_TRIES: 2,
     PROBE_TIMEOUT: 3.0,
-    SOCKS5_PORT: 10808,
-    HTTP_PORT: 10809,
+    // FIX(#1c): dead SOCKS5/HTTP defaults removed (see AppConfig).
   };
 }
 
@@ -148,7 +147,6 @@ export function normalizeConfig(raw: any): AppConfig {
     MODE: String(get("MODE", "mode", base.MODE)),
     PROBE_TRIES: Number(get("PROBE_TRIES", "probe_tries", base.PROBE_TRIES)),
     PROBE_TIMEOUT: Number(get("PROBE_TIMEOUT", "probe_timeout", base.PROBE_TIMEOUT)),
-    SOCKS5_PORT: Number(get("SOCKS5_PORT", "socks5_port", base.SOCKS5_PORT)),
-    HTTP_PORT: Number(get("HTTP_PORT", "http_port", base.HTTP_PORT)),
+    // FIX(#1c): SOCKS5/HTTP keys no longer normalized; old files still load, keys ignored.
   };
 }

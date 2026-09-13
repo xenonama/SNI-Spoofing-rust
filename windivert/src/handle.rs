@@ -175,10 +175,13 @@ impl WindivertHandle {
 impl Packet {
     #[cfg(windows)]
     pub(crate) fn from_address(raw: Vec<u8>, addr: &ffi::WindivertAddress) -> Self {
-        let direction = match addr.direction {
-            ffi::WINDIVERT_DIRECTION_INBOUND => Direction::Inbound,
-            ffi::WINDIVERT_DIRECTION_OUTBOUND => Direction::Outbound,
-            _ => Direction::Unknown,
+        // FIX: WinDivert 2.2 packs direction into bit 17 of the u32 at
+        // offset 8 (the old struct field `direction` never existed in 2.2;
+        // reading offset 8 yielded Layer=NETWORK=0 -> always Outbound).
+        let direction = if addr.outbound() {
+            Direction::Outbound
+        } else {
+            Direction::Inbound
         };
         Self {
             direction,

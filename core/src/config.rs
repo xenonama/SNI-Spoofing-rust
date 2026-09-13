@@ -321,7 +321,9 @@ pub fn migrate(v: serde_json::Value) -> Result<Config, ConfigError> {
             .and_then(|n| u8::try_from(n).ok())
             .or_else(|| x.as_str()?.trim().parse::<u8>().ok())
     }) {
-        cfg.seq_overlap = o.min(16);
+        // FIX: don't coerce here; let validate() reject >16 so bad input
+        // surfaces instead of silently clamping (previously unreachable check).
+        cfg.seq_overlap = o;
     }
     if let Some(f) = get_str("TLS_FINGERPRINT") {
         cfg.tls_fingerprint = f.to_lowercase();
@@ -421,6 +423,25 @@ pub fn validate(cfg: &Config) -> Result<(), ConfigError> {
     if !SUPPORTED_MODES.contains(&cfg.mode.as_str()) {
         errs.push(format!("MODE must be one of {:?}", SUPPORTED_MODES));
     }
+    // FIX: previously migrated but never validated — bad values passed silently.
+    if cfg.padding_size > 128 {
+        errs.push("PADDING_SIZE should be 0..128".to_string());
+    }
+    if !(1..=10).contains(&cfg.probe_tries) {
+        errs.push("PROBE_TRIES should be 1..10".to_string());
+    }
+    if !(0.5..=10.0).contains(&cfg.probe_timeout) {
+        errs.push("PROBE_TIMEOUT should be 0.5..10s".to_string());
+    }
+    if cfg.socks5_port == 0 || cfg.http_port == 0 {
+        errs.push("SOCKS5_PORT/HTTP_PORT must be 1-65535".to_string());
+    }
+    if cfg.socks5_port == cfg.listen_port
+        || cfg.http_port == cfg.listen_port
+        || (cfg.socks5_port == cfg.http_port && cfg.socks5_port != 0)
+    {
+        errs.push("SOCKS5_PORT/HTTP_PORT must not collide with LISTEN_PORT or each other".to_string());
+    }
     if errs.is_empty() {
         Ok(())
     } else {
@@ -442,8 +463,36 @@ pub fn is_valid_ipv4(ip: &str) -> bool {
 }
 
 pub fn is_valid_sni(s: &str) -> bool {
+    // FIX P2: align with injector template (tls.rs MAX_SNI_LEN=219) so a
+    // config-valid SNI can never silently produce an empty fake hello.
+    // Also reject malformed hostnames: empty labels, leading/trailing
+    // dot/hyphen, spaces/slashes, invalid chars, IP literals get checked
+    // by the caller where relevant.
     let s = s.trim();
-    !s.is_empty() && s.contains('.') && !s.contains(' ') && !s.contains('/') && s.len() <= 253
+    if s.is_empty() || s.len() > 219 || !s.contains('.') {
+        return false;
+    }
+    if s.contains(' ') || s.contains('/') || s.contains(':') {
+        return false;
+    }
+    if s.starts_with('.') || s.ends_with('.') || s.contains("..") {
+        return false;
+    }
+    if s.starts_with('-') || s.ends_with('-') {
+        return false;
+    }
+    for label in s.split('.') {
+        if label.is_empty() || label.len() > 63 {
+            return false;
+        }
+        if label.starts_with('-') || label.ends_with('-') {
+            return false;
+        }
+        if !label.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
+            return false;
+        }
+    }
+    true
 }
 
 fn truncate(s: &str, n: usize) -> String {

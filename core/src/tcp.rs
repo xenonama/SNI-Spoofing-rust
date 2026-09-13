@@ -7,7 +7,9 @@
 //! Phase 2 provides:
 //! - `parse_ip_tcp` / `tcp_info` (for handshake validation = `build_ack` side)
 //! - `build_fake_tcp` (single old-seq segment = core `wrong_seq` primitive)
-//! - `apply_plan` (multi-segment send for split/fragmented/hostfakesplit/...)
+//! - Multi-segment sends are built by `fake_tcp::plan_fake` (split/overlap in
+//!   TCP sequence space, not IP fragmentation) and emitted one `build_fake_tcp`
+//!   call per segment.
 //! - IP + TCP checksum recalculation (pydivert did this implicitly on `send`).
 
 use byteorder::{BigEndian, ByteOrder};

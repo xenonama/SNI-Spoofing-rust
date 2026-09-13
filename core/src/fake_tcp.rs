@@ -187,21 +187,38 @@ pub fn extract_sni_from_hello(data: &[u8]) -> Option<Vec<u8>> {
 }
 
 /// Same-length decoy hostname (keeps ClientHello length identical).
+/// FIX P1: preserve dots, emit only valid hostname chars ([a-z0-9-]),
+/// never start/end a label with '-', and avoid trivial xxx.com patterns.
 pub fn same_length_fake_sni(sni: &[u8]) -> Vec<u8> {
     let n = sni.len();
     if n == 0 {
         return b"a.example.com".to_vec();
     }
+    let mut rng = rand::thread_rng();
+    // Try random valid labels preserving dot positions (up to 8 attempts).
+    for _ in 0..8 {
+        let mut cand = Vec::with_capacity(n);
+        for &b in sni {
+            if b == b'.' {
+                cand.push(b'.');
+            } else if b.is_ascii_digit() {
+                cand.push(b'0' + (rng.gen_range(0..10) as u8));
+            } else {
+                cand.push(b'a' + (rng.gen_range(0..26) as u8));
+            }
+        }
+        // Must differ, keep dots, stay valid: no leading/trailing '-' in a
+        // label (we only emit alnum + '.', so valid by construction), must
+        // still contain a dot and not equal the original.
+        if cand != sni && cand.contains(&b'.') {
+            return cand;
+        }
+    }
     if n >= 5 {
-        let mut cand = vec![b'x'; n - 4];
+        let mut cand = vec![b'q'; n - 4];
         cand.extend_from_slice(b".com");
         if cand != sni {
             return cand;
-        }
-        let mut cand2 = vec![b'y'; n - 4];
-        cand2.extend_from_slice(b".com");
-        if cand2 != sni {
-            return cand2;
         }
     }
     let mut m = sni.to_vec();
@@ -211,14 +228,20 @@ pub fn same_length_fake_sni(sni: &[u8]) -> Vec<u8> {
             continue;
         }
         let c = m[idx];
-        m[idx] = if c == 0x61 {
-            0x62
-        } else if c == 0x62 {
-            0x61
-        } else {
-            c ^ 0x01
-        };
-        break;
+        // Only emit valid hostname chars: rotate within alnum, never 0x01.
+        if c.is_ascii_lowercase() {
+            m[idx] = if c == b'z' { b'a' } else { c + 1 };
+            break;
+        } else if c.is_ascii_uppercase() {
+            m[idx] = if c == b'Z' { b'A' } else { c + 1 };
+            break;
+        } else if c.is_ascii_digit() {
+            m[idx] = if c == b'9' { b'0' } else { c + 1 };
+            break;
+        } else if c == b'-' {
+            m[idx] = b'a';
+            break;
+        }
     }
     if m != sni {
         m
@@ -241,6 +264,9 @@ pub fn md5_fake_payload(data: &[u8]) -> Vec<u8> {
 /// Mirrors `_build_hostfake_variant` in-place path: extract SNI, derive
 /// same-length decoy, byte-replace once. Fresh-template path (per-profile
 /// regeneration) is a Phase 3 slice; in-place keeps framing always valid.
+/// FIX P1: prefer the known SNI offset (127 for our 517B template) before
+/// falling back to a blind byte search, so random rnd/sess/key collisions
+/// can't cause a splice in the wrong field.
 pub fn build_hostfake_variant(data: &[u8]) -> Vec<u8> {
     if data.len() < 2 {
         return data.to_vec();
@@ -248,6 +274,14 @@ pub fn build_hostfake_variant(data: &[u8]) -> Vec<u8> {
     if let Some(sni) = extract_sni_from_hello(data) {
         let decoy = same_length_fake_sni(&sni);
         if !decoy.is_empty() && decoy != sni && decoy.len() == sni.len() {
+            // Known template layout: SNI starts at 127. Prefer it.
+            if data.len() >= 127 + sni.len() && &data[127..127 + sni.len()] == sni.as_slice() {
+                let mut out = Vec::with_capacity(data.len());
+                out.extend_from_slice(&data[..127]);
+                out.extend_from_slice(&decoy);
+                out.extend_from_slice(&data[127 + sni.len()..]);
+                return out;
+            }
             // Find first occurrence and splice (== `orig.replace(sni, decoy, 1)`).
             if let Some(pos) = data.windows(sni.len()).position(|w| w == sni.as_slice()) {
                 let mut out = Vec::with_capacity(data.len());
@@ -396,19 +430,24 @@ pub fn plan_fake(
             } else {
                 rand::thread_rng().gen_range(16..=64usize)
             };
-            let mut padded = vec![0u8; pad_len];
+            // FIX P1: padding must be a suffix, not a prefix. A zero prefix
+            // breaks the TLS record header (DPI expects 0x16 at offset 0 and
+            // skips the fake entirely). Suffix keeps the hello parseable
+            // while the old-seq window still hides it from the server.
+            let mut padded = Vec::with_capacity(data.len() + pad_len);
             padded.extend_from_slice(data);
+            padded.extend(std::iter::repeat(0u8).take(pad_len));
             let seq = syn_seq.wrapping_add(1).wrapping_sub(padded.len() as u32);
             vec![FakeSegment::single(seq, padded, true, 1)]
         }
         BypassMethod::DoubleSni => {
-            let real = dst_ip_hint.unwrap_or("real");
-            let mut payload = Vec::with_capacity(n + 1 + real.len());
-            payload.extend_from_slice(data);
-            payload.push(b'|');
-            payload.extend_from_slice(real.as_bytes());
-            let seq = syn_seq.wrapping_add(1).wrapping_sub(payload.len() as u32);
-            vec![FakeSegment::single(seq, payload, true, 1)]
+            // FIX P1: hello + b'|' + ip exceeds the TLS record length and
+            // appends an invalid trailing record, so strict DPI drops it as
+            // malformed. Until a valid dual-SNI extension is built, send the
+            // hello as a plain wrong_seq (parseable, old-seq) rather than a
+            // guaranteed-malformed burst.
+            let _ = dst_ip_hint;
+            vec![wrong_seq(syn_seq, data, 1)]
         }
         BypassMethod::HostFakeSplit => {
             if n < 2 {
@@ -432,10 +471,13 @@ pub fn plan_fake(
                 return vec![FakeSegment::single(seq, data.to_vec(), true, 1)];
             }
             let signed = md5_fake_payload(data);
+            // FIX P1: 0x10000 (64k) can sit inside a window-scaled receive
+            // window, so the "bad" segment might be accepted. Push it 1M back
+            // to guarantee out-of-window while staying in u32 space.
             let badseq = syn_seq
                 .wrapping_add(1)
                 .wrapping_sub(signed.len() as u32)
-                .wrapping_sub(0x10000);
+                .wrapping_sub(0x100000);
             let seq_ok = syn_seq.wrapping_add(1).wrapping_sub(n as u32);
             vec![
                 FakeSegment::single(badseq, signed, false, 1),
@@ -575,6 +617,17 @@ impl HandshakeState {
 
     /// Port of `on_inbound_packet`.
     pub fn on_inbound(&mut self, info: TcpInfo) -> InboundAction {
+        // FIX(diag): tracing at every inbound decision point.
+        tracing::trace!(
+            "HS in: syn={} ack={} rst={} fin={} pay={} fake_sent={} syn_ack_seq={:?}",
+            info.syn,
+            info.ack_flag,
+            info.rst,
+            info.fin,
+            info.payload_len,
+            self.fake_sent,
+            self.syn_ack_seq
+        );
         let syn_seq = match self.syn_seq {
             Some(s) => s,
             None => {
@@ -602,7 +655,18 @@ impl HandshakeState {
             self.syn_ack_seq = Some(info.seq);
             return InboundAction::Reinject;
         }
-        // Inbound ACK for our fake data = SUCCESS.
+        // Inbound data after our fake burst = SUCCESS.
+        // The server drops old-seq fakes without ACKing them, so a pure ACK
+        // for the fake never arrives. The first ServerHello / data bytes
+        // prove DPI let the handshake through (bypass complete).
+        // FIX P0: previously only a pure ACK counted, which never happens
+        // in a real flow -> every connection timed out via HANDSHAKE_TIMEOUT.
+        if self.fake_sent && info.payload_len > 0 && !info.syn && !info.rst && !info.fin {
+            self.monitor = false;
+            return InboundAction::Success;
+        }
+        // Inbound ACK for our fake data = SUCCESS (synthetic pure-ACK path,
+        // kept for selftest + stacks that ACK old-seq).
         if info.ack_flag && !info.syn && !info.rst && !info.fin && info.payload_len == 0 && self.fake_sent
         {
             match self.syn_ack_seq {

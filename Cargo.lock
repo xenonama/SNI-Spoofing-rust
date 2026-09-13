@@ -346,7 +346,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "sni-engine-ffi"
+name = "sni-engine"
 version = "2.0.0"
 dependencies = [
  "anyhow",

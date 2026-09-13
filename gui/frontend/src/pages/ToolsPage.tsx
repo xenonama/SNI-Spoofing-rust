@@ -48,7 +48,7 @@ export default function ToolsPage() {
           <Button
             variant="primary"
             disabled={probing || probeResults.length === 0}
-            onClick={() => useFastest()}
+            onClick={() => void useFastest()}
             title="Replace the endpoints list with the fastest reachable one"
           >
             Use fastest

@@ -16,7 +16,7 @@ use crate::worker::{ConnId, Worker};
 use parking_lot::Mutex as ParkMutex;
 use sni_core::{
     config::Config,
-    fake_tcp::{plan_fake, BypassMethod, FakeParams, HandshakeState, InboundAction, OutboundAction},
+    fake_tcp::{plan_delayed_retry_second, plan_fake, BypassMethod, FakeParams, HandshakeState, InboundAction, OutboundAction},
     picker::pick_sni,
     stats::Stats,
     tcp::{build_fake_tcp, parse_ip_tcp, tcp_info},
@@ -70,14 +70,17 @@ impl EngineHandle {
         let quic_mode = wcfg.quic_mode.clone();
         let trojan = wcfg.mode.trim() == "Trojan + Xray";
         let quic_need = quic_mode == "block" || quic_mode == "spoof";
+        // FIX P3: fail-closed QUIC. If the user asked to block/spoof QUIC and
+        // the driver can't open, return an error instead of silently
+        // continuing TCP-only (which would leak QUIC around the bypass).
         let quic: Option<WindivertHandle> = if quic_need {
             match WindivertHandle::open(worker.quic_filter()) {
                 Ok(h) => Some(h),
                 Err(e) => {
-                    // Via the FfiLogLayer this lands in the console as
-                    // "[WARN] ..." (and on stdout through the fmt layer).
-                    tracing::warn!("QUIC injector unavailable ({}); TCP-only", e);
-                    None
+                    return Err(format!(
+                        "WinDivert QUIC open failed (quic_mode={}): {}. Run as Administrator, keep WinDivert.dll + WinDivert64.sys next to the exe.",
+                        quic_mode, e
+                    ));
                 }
             }
         } else {
@@ -124,6 +127,7 @@ impl EngineHandle {
                 TlsProfile::parse(&wcfg.tls_fingerprint).unwrap_or(TlsProfile::Legacy);
             let snis = wcfg.fake_snis.clone();
             let iface = worker.interface_ipv4.clone();
+            let fake_delay = wcfg.fake_delay;
             threads.push(
                 std::thread::Builder::new()
                     .name("windivert-tcp".into())
@@ -131,7 +135,7 @@ impl EngineHandle {
                         h.run(|pkt| {
                             dispatch_tcp_packet(
                                 &h, &pkt, &w, &rt_h, &dpi, method, &params, profile,
-                                &snis, &iface,
+                                &snis, &iface, fake_delay,
                             );
                         });
                     })
@@ -146,15 +150,21 @@ impl EngineHandle {
                     .name("windivert-quic".into())
                     .spawn(move || {
                         qh.run(|pkt| {
-                            if trojan {
+                            // FIX P3: trojan passthrough must not override an
+                            // explicit block. Only passthrough mode (no QUIC
+                            // thread) allows QUIC; block/spoof always drop.
+                            // FIX P3: spoof has no crypto (QUIC Initial is
+                            // encrypted) so fail-closed as drop, not forward.
+                            // Trojan+Xray with block still drops here; with
+                            // passthrough there is no thread by construction.
+                            if trojan && quic_mode != "block" && quic_mode != "spoof" {
                                 let _ = qh.send(&pkt);
                                 return;
                             }
-                            if quic_mode == "block" {
-                                return; // drop: browser falls back to TCP
-                            }
-                            // spoof: fail-open forward until SNI-swap lands.
-                            let _ = qh.send(&pkt);
+                            // block + spoof (no SNI-swap yet): drop so the
+                            // browser falls back to TCP instead of leaking.
+                            let _ = quic_mode;
+                            return;
                         });
                     })
                     .map_err(|e| format!("cannot spawn QUIC thread: {}", e))?,
@@ -251,6 +261,7 @@ fn dispatch_tcp_packet(
     profile: TlsProfile,
     snis: &[String],
     iface: &str,
+    fake_delay: f64,
 ) {
     let raw = pkt.bytes();
     let reinject = || {
@@ -276,7 +287,25 @@ fn dispatch_tcp_packet(
     let src_ip = format!("{}.{}.{}.{}", ip.src[0], ip.src[1], ip.src[2], ip.src[3]);
     let dst_ip = format!("{}.{}.{}.{}", ip.dst[0], ip.dst[1], ip.dst[2], ip.dst[3]);
 
-    let outbound = src_ip == iface;
+    // FIX P4: use WinDivert direction when known; IP compare breaks on
+    // VPN / multi-route where the socket local IP != interface_ipv4.
+    let outbound = match pkt.direction {
+        sni_windivert::Direction::Outbound => true,
+        sni_windivert::Direction::Inbound => false,
+        sni_windivert::Direction::Unknown => src_ip == iface,
+    };
+    // FIX(diag): per-packet entry log (direction + endpoints + length).
+    // FIX(perf): demoted to debug — info here fires for EVERY packet
+    // (hundreds of thousands of lines/sec) and saturates the log buffer.
+    tracing::debug!(
+        "DPI pkt dir={} {}:{} -> {}:{} len={}",
+        if outbound { "OUT" } else { "IN" },
+        src_ip,
+        sport,
+        dst_ip,
+        dport,
+        raw.len()
+    );
     // Normalized client-first key; doubles as the Worker's ConnId.
     let key: DpiKey = if outbound {
         (src_ip, sport, dst_ip, dport)
@@ -284,6 +313,8 @@ fn dispatch_tcp_packet(
         (dst_ip, dport, src_ip, sport)
     };
 
+    // FIX(perf): tcp_info moved UP so the fast-path guard below can test
+    // is_handshake_pkt before touching any DPI state.
     let info = match tcp_info(raw) {
         Some(i) => i,
         None => {
@@ -292,13 +323,60 @@ fn dispatch_tcp_packet(
         }
     };
 
+    // FIX(perf): only run the DPI state machine for tuples that belong
+    // to a connection the Worker actually created (client side matched
+    // by (client_ip, client_port, endpoint_ip, endpoint_port)). Any
+    // other traffic that happens to share the endpoint IP is forwarded
+    // untouched — this prevents the DPI filter from acting on the
+    // system's normal Cloudflare traffic.
+    // FIX(perf): sync check via active_relays (parking_lot, no runtime
+    // needed). `conns` is a tokio Mutex and is evicted before relay, so
+    // it cannot be used here.
+    // FIX(perf): fast-path guard. The DPI filter matches traffic by
+    // (client IP, endpoint IP, port 443) and can capture unrelated
+    // system traffic when the endpoint is a shared anycast IP (e.g.
+    // Cloudflare). Only run the state machine for tuples we actually
+    // own.
+    // FIX: `dpi_conns` mirrors `conns` (short-lived: evicted before relay),
+    // so a ClientHello sent after evict would miss it. Also accept
+    // `is_known_relay` (active_relays, lives for the whole relay) as a
+    // fallback — otherwise the bypass silently disables. Either hit means
+    // "our connection"; anything else is forwarded untouched.
+    // FIX(#2b): after FIX(#2a) the outgoing tuple is seeded in
+    // dpi_conns before the SYN leaves the socket, so we no longer
+    // need to exempt SYN / SYN-ACK / RST / FIN. Only process tuples
+    // the Worker actually owns.
+    let known = worker
+        .dpi_conns
+        .lock()
+        .contains(&(key.0.clone(), key.1, key.2.clone(), key.3));
+    let known = known || worker.is_known_relay(&key);
+    if !known {
+        reinject();
+        return;
+    }
+
     // RST/FIN: connection is dead — drop DPI state, wake the waiter so the
     // relay task doesn't linger until HANDSHAKE_TIMEOUT.
+    // FIX: RST/FIN before fake = real failure; after fake = server
+    // rejecting our old-seq segment, which is EXPECTED. Do not fail
+    // the connection in that case — let the relay continue; the real
+    // ClientHello may still succeed.
     if info.rst || info.fin {
-        dpi.lock().remove(&key);
-        let conn: ConnId = (key.0.clone(), key.1, key.2.clone(), key.3);
-        let w = Arc::clone(worker);
-        rt.block_on(w.complete_handshake(&conn, false));
+        let should_fail = {
+            let map = dpi.lock();
+            map.get(&key).map(|st| !st.fake_sent).unwrap_or(true)
+        };
+        if should_fail {
+            dpi.lock().remove(&key);
+            let conn: ConnId = (key.0.clone(), key.1, key.2.clone(), key.3);
+            // FIX(perf): spawn instead of block_on — the capture thread
+            // must not stall waiting for the runtime.
+            let w = Arc::clone(worker);
+            rt.spawn(async move {
+                w.complete_handshake(&conn, false).await;
+            });
+        }
         reinject();
         return;
     }
@@ -306,44 +384,42 @@ fn dispatch_tcp_packet(
     if outbound {
         enum Next {
             Forward,
-            FakeBurst(Vec<Vec<u8>>),
+            FakeBurst(Vec<Vec<u8>>, Option<RetryCtx>),
             Fail,
         }
-        let next = {
+        struct RetryCtx {
+            syn: u32,
+            hello: Vec<u8>,
+            ident_base: u16,
+            ttl: u8,
+            template: Vec<u8>,
+        }
+        // FIX P4: narrow DPI lock scope — only touch state under lock,
+        // build fake bytes outside so other connections don't head-of-line
+        // block on pick_sni / ClientHello / checksums.
+        // FIX P0: bound DpiMap so a Success-never-arrives regression can't
+        // grow it without limit (removal still happens on Success/Fail/RST).
+        enum OutNext {
+            Forward,
+            Fail,
+            NeedFake(u32, BypassMethod),
+        }
+        let out_next: OutNext = {
             let mut map = dpi.lock();
-            let st = map.entry(key.clone()).or_insert_with(|| HandshakeState::new(method));
+            if map.len() > 4096 {
+                map.clear();
+            }
+            // FIX(#7): ask the Worker for the sticky method when config is
+            // "auto". For a concrete config this returns the same method
+            // every time, so behaviour is unchanged.
+            let conn_method = worker.resolve_method_for_connection(method);
+            let st = map.entry(key.clone()).or_insert_with(|| HandshakeState::new(conn_method));
             match st.on_outbound(info) {
-                OutboundAction::Reinject => Next::Forward,
+                OutboundAction::Reinject => OutNext::Forward,
                 OutboundAction::TriggerFake => {
                     let syn = st.syn_seq.unwrap_or_else(|| info.seq.wrapping_sub(1));
                     let m = st.method;
-                    // Fake ClientHello with a random SNI from the pool.
-                    // (The relay task picks its own SNI for accounting; the
-                    // wire decoy only needs pool membership + validity.)
-                    let sni = pick_sni(snis).unwrap_or_else(|| "example.com".to_string());
-                    let hello = build_fake_client_hello(sni.as_bytes(), profile);
-                    let segs = plan_fake(m, syn, &hello, params, Some(key.2.as_str()));
-                    let ident = u16::from_be_bytes([raw[4], raw[5]]);
-                    let ttl = raw[8];
-                    let mut built = Vec::with_capacity(segs.len());
-                    for s in &segs {
-                        let ttl_ov = if s.ttl_decrement {
-                            Some(ttl.saturating_sub(1).max(1))
-                        } else {
-                            None
-                        };
-                        if let Some(bytes) =
-                            build_fake_tcp(raw, s.seq, &s.payload, s.psh, ident.wrapping_add(s.ident_plus), ttl_ov)
-                        {
-                            built.push(bytes);
-                        }
-                    }
-                    st.mark_fake_sent();
-                    if built.is_empty() {
-                        Next::Forward
-                    } else {
-                        Next::FakeBurst(built)
-                    }
+                    OutNext::NeedFake(syn, m)
                 }
                 OutboundAction::Unexpected(msg) => {
                     // Post-fake data (e.g. relay bytes on the same 4-tuple)
@@ -351,23 +427,146 @@ fn dispatch_tcp_packet(
                     // genuine handshake violations fail early.
                     if st.fake_sent {
                         tracing::debug!("post-fake outbound (forwarding): {}", msg);
-                        Next::Forward
+                        OutNext::Forward
                     } else {
                         tracing::debug!("unexpected outbound (failing): {}", msg);
                         map.remove(&key);
-                        Next::Fail
+                        OutNext::Fail
                     }
                 }
             }
         };
+        let next = match out_next {
+            OutNext::Forward => Next::Forward,
+            OutNext::Fail => Next::Fail,
+            OutNext::NeedFake(syn, m) => {
+            // Fake ClientHello with a random SNI from the pool.
+            let sni = pick_sni(snis).unwrap_or_else(|| "example.com".to_string());
+            let hello = build_fake_client_hello(sni.as_bytes(), profile);
+            // FIX P2: empty hello (SNI too long) must not emit a bare ACK;
+            // forward the original so bypass doesn't silently disable.
+            if hello.is_empty() {
+                tracing::debug!("empty fake hello (SNI too long), forwarding");
+                Next::Forward
+            } else {
+                let segs = plan_fake(m, syn, &hello, params, Some(key.2.as_str()));
+                // FIX(#6): tell the worker which actual method the DPI committed
+                // to. When config is "auto", the DPI resolved it to `m` (a real
+                // method). Stats will rank this real method, not "auto".
+                {
+                    let conn: ConnId = (key.0.clone(), key.1, key.2.clone(), key.3);
+                    worker.record_resolved_method(&conn, m.as_str());
+                }
+                let ident = u16::from_be_bytes([raw[4], raw[5]]);
+                let ttl = raw[8];
+                let mut built = Vec::with_capacity(segs.len());
+                for s in &segs {
+                    // FIX P1: wrong_seq_ttl ttl-1 never expires (64->63 still
+                    // reaches server). Use low TTL so local DPI sees it but
+                    // it dies before the server (classic TTL trick).
+                    let ttl_ov = if s.ttl_decrement {
+                        Some(ttl.min(8).max(1))
+                    } else {
+                        None
+                    };
+                    if let Some(bytes) =
+                        build_fake_tcp(raw, s.seq, &s.payload, s.psh, ident.wrapping_add(s.ident_plus), ttl_ov)
+                    {
+                        built.push(bytes);
+                    }
+                }
+                // Mark sent under lock (entry must still exist; TriggerFake
+                // created it above).
+                {
+                    let mut map = dpi.lock();
+                    if let Some(st) = map.get_mut(&key) {
+                        st.mark_fake_sent();
+                    }
+                }
+                if built.is_empty() {
+                    Next::Forward
+                } else {
+                    // FIX P1: retain retry context so delayed_retry can emit
+                    // its split_seq second burst after 1.5s (previously the
+                    // planner existed but was never called -> == wrong_seq).
+                    let retry = if m == BypassMethod::DelayedRetry {
+                        Some(RetryCtx {
+                            syn,
+                            hello: hello.clone(),
+                            ident_base: ident,
+                            ttl,
+                            template: raw.to_vec(),
+                        })
+                    } else {
+                        None
+                    };
+                    Next::FakeBurst(built, retry)
+                }
+            }
+            }
+        };
         match next {
             Next::Forward => reinject(),
-            Next::FakeBurst(blobs) => {
+            Next::FakeBurst(blobs, retry) => {
+                // FIX 4: honor cfg.fake_delay (Python sleeps fake_delay secs
+                // before sending fake segments); blocking capture thread so
+                // std::thread::sleep is correct. No sleep when 0.0.
+                if fake_delay > 0.0 {
+                    std::thread::sleep(std::time::Duration::from_secs_f64(
+                        fake_delay.clamp(0.0, 5.0),
+                    ));
+                }
+                // FIX(diag): fake burst size/method visibility.
+                // FIX(perf): demoted to debug to avoid per-handshake info spam.
+                tracing::debug!(
+                    "DPI: sending {} fake segment(s) method={}",
+                    blobs.len(),
+                    method.as_str()
+                );
                 for b in &blobs {
                     let fp = pkt.with_raw(b.clone());
                     if let Err(e) = handle.send(&fp) {
                         tracing::debug!("fake send failed (surviving): {}", e);
                     }
+                }
+                // FIX P1: delayed_retry second burst (split_seq after 1.5s).
+                // Off the capture thread so other connections don't stall.
+                if let Some(ctx) = retry {
+                    let h2 = handle.clone();
+                    let pkt2 = pkt.clone();
+                    let dpi2 = Arc::clone(dpi);
+                    let key2 = key.clone();
+                    let params2 = *params;
+                    std::thread::Builder::new()
+                        .name("delayed-retry".into())
+                        .spawn(move || {
+                            std::thread::sleep(std::time::Duration::from_millis(1500));
+                            let still_monitored = {
+                                let map = dpi2.lock();
+                                matches!(map.get(&key2), Some(st) if st.fake_sent && st.monitor)
+                            };
+                            if !still_monitored {
+                                return;
+                            }
+                            let segs = plan_delayed_retry_second(ctx.syn, &ctx.hello, true);
+                            for s in &segs {
+                                if let Some(bytes) = build_fake_tcp(
+                                    &ctx.template,
+                                    s.seq,
+                                    &s.payload,
+                                    s.psh,
+                                    ctx.ident_base.wrapping_add(s.ident_plus).wrapping_add(10),
+                                    None,
+                                ) {
+                                    let fp = pkt2.with_raw(bytes);
+                                    if let Err(e) = h2.send(&fp) {
+                                        tracing::debug!("delayed retry send failed: {}", e);
+                                    }
+                                }
+                            }
+                            let _ = (params2, ctx.ttl);
+                        })
+                        .ok();
                 }
                 reinject(); // original follows the fakes (wrong_seq primitive)
                 // Cooperative yield: injection bursts are hot paths; yielding
@@ -376,8 +575,12 @@ fn dispatch_tcp_packet(
             }
             Next::Fail => {
                 let conn: ConnId = (key.0.clone(), key.1, key.2.clone(), key.3);
+                // FIX(perf): spawn instead of block_on — the capture thread
+                // must not stall waiting for the runtime.
                 let w = Arc::clone(worker);
-                rt.block_on(w.complete_handshake(&conn, false));
+                rt.spawn(async move {
+                    w.complete_handshake(&conn, false).await;
+                });
                 reinject();
             }
         }
@@ -389,18 +592,28 @@ fn dispatch_tcp_packet(
         }
         let next = {
             let mut map = dpi.lock();
-            let st = map.entry(key.clone()).or_insert_with(|| HandshakeState::new(method));
+            // FIX(#7): ask the Worker for the sticky method when config is
+            // "auto". For a concrete config this returns the same method
+            // every time, so behaviour is unchanged.
+            let conn_method = worker.resolve_method_for_connection(method);
+            let st = map.entry(key.clone()).or_insert_with(|| HandshakeState::new(conn_method));
             match st.on_inbound(info) {
                 InboundAction::Reinject => NextIn::Forward,
                 InboundAction::Success => {
+                    // FIX(diag): visible success path (pure ACK vs ServerHello payload).
+                    tracing::info!("DPI: inbound SUCCESS key={:?}", key);
                     map.remove(&key);
                     NextIn::Succeed
                 }
                 InboundAction::Unexpected(msg) => {
                     if st.fake_sent {
+                        // FIX(diag): inbound UNEXPECTED after fake_sent (forward path).
+                        tracing::info!("DPI: inbound UNEXPECTED fake_sent={}: {}", st.fake_sent, msg);
                         tracing::debug!("post-fake inbound (forwarding): {}", msg);
                         NextIn::Forward
                     } else {
+                        // FIX(diag): inbound UNEXPECTED before fake_sent (fail path).
+                        tracing::info!("DPI: inbound UNEXPECTED fake_sent={}: {}", st.fake_sent, msg);
                         tracing::debug!("unexpected inbound (failing): {}", msg);
                         map.remove(&key);
                         NextIn::Fail
@@ -413,13 +626,21 @@ fn dispatch_tcp_packet(
             NextIn::Succeed => {
                 reinject();
                 let conn: ConnId = (key.0.clone(), key.1, key.2.clone(), key.3);
+                // FIX(perf): spawn instead of block_on — the capture thread
+                // must not stall waiting for the runtime.
                 let w = Arc::clone(worker);
-                rt.block_on(w.complete_handshake(&conn, true));
+                rt.spawn(async move {
+                    w.complete_handshake(&conn, true).await;
+                });
             }
             NextIn::Fail => {
                 let conn: ConnId = (key.0.clone(), key.1, key.2.clone(), key.3);
+                // FIX(perf): spawn instead of block_on — the capture thread
+                // must not stall waiting for the runtime.
                 let w = Arc::clone(worker);
-                rt.block_on(w.complete_handshake(&conn, false));
+                rt.spawn(async move {
+                    w.complete_handshake(&conn, false).await;
+                });
                 reinject();
             }
         }

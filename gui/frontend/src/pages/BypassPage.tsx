@@ -137,7 +137,8 @@ export default function BypassPage() {
                 }}
               />
             </Field>
-            <Field label="Bypass method">
+            {/* FIX(#7): auto is sticky with rotation budget; Best method shows the real winner. */}
+            <Field label="Bypass method" hint="auto = the engine sticks to one real method for up to 10 connections / 60s, then rotates if it sees 3+ failures. The Best method panel shows the real winning method, not 'auto'. Pick a specific method to disable rotation.">
               <MethodPicker value={cfg.BYPASS_METHOD} onChange={(m) => patch({ BYPASS_METHOD: m })} />
             </Field>
           </div>
@@ -185,11 +186,12 @@ export default function BypassPage() {
               }}
             />
           </Field>
-          <Field label="TLS fingerprint" hint="Which browser ClientHello to mimic.">
+          {/* FIX(#5a): honesty — only legacy differs today (see audit #5). */}
+          <Field label="TLS fingerprint" hint="Which browser ClientHello to mimic. Only 'legacy' produces a distinct template today; chrome_* and firefox_* currently reuse the legacy 517B template (see audit #5).">
             <select
               className="input cursor-pointer"
               value={cfg.TLS_FINGERPRINT}
-              title="Which browser ClientHello to mimic."
+              title="Which browser ClientHello to mimic. Only 'legacy' produces a distinct template today; chrome_* and firefox_* currently reuse the legacy 517B template (see audit #5)."
               onChange={(e) => patch({ TLS_FINGERPRINT: e.target.value })}
             >
               {["legacy", "chrome_120", "chrome_124", "firefox_122", "firefox_124", "custom"].map((f) => (
@@ -199,11 +201,12 @@ export default function BypassPage() {
               ))}
             </select>
           </Field>
-          <Field label="QUIC mode" hint="block = drop UDP/443; spoof = SNI swap; passthrough.">
+          {/* FIX(#4a): honesty — spoof == block until QUIC Initial crypto lands (see audit #4). */}
+          <Field label="QUIC mode" hint="block = drop UDP/443. spoof = same as block until QUIC Initial crypto lands (see audit #4). passthrough = forward untouched.">
             <select
               className="input cursor-pointer"
               value={cfg.QUIC_MODE}
-              title="block = drop UDP/443; spoof = SNI swap; passthrough."
+              title="block = drop UDP/443. spoof = same as block until QUIC Initial crypto lands (see audit #4). passthrough = forward untouched."
               onChange={(e) => patch({ QUIC_MODE: e.target.value })}
             >
               {["block", "spoof", "passthrough"].map((f) => (

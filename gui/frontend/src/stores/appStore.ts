@@ -1,5 +1,6 @@
 import { create } from "zustand";
 import * as api from "../api";
+import { useConfirmStore } from "./confirmStore";
 import {
   normalizeConfig,
   defaultConfig,
@@ -69,7 +70,7 @@ interface AppState {
     exportLogs: () => Promise<void>;
     runProbeEndpoints: () => Promise<void>;
     runProbeSnis: () => Promise<void>;
-    useFastest: () => void;
+    useFastest: () => Promise<void>;
   };
 }
 
@@ -389,15 +390,21 @@ export const useAppStore = create<AppState>((set, get) => ({
         throw new Error("SNI probe failed");
       }
     },
-    useFastest: () => {
+    useFastest: async () => {
       const fastest = get().probeResults.find((p) => p.reachable);
       if (fastest) {
         const [ip, portStr] = fastest.endpoint.split(":");
         // FIX(F3): destructive overwrite — confirm first so a misclick
         // can't silently discard the hand-tuned endpoint list.
+        // FIX: replace native confirm with in-app modal
         if (
           get().config.ENDPOINTS.length > 0 &&
-          !window.confirm(`Replace endpoints with fastest (${fastest.endpoint})?`)
+          !(await useConfirmStore
+            .getState()
+            .confirm({
+              title: "Confirm",
+              message: `Replace endpoints with fastest (${fastest.endpoint})?`,
+            }))
         ) {
           return;
         }

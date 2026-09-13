@@ -32,22 +32,43 @@ pub fn parse_ip_list(path: &Path) -> Vec<(String, u16)> {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
+        // FIX 5: parse the /prefix correctly — compute network = ip & mask,
+        // then first usable per RFC (32 → itself, 31 → network per RFC 3021,
+        // <=30 → network + 1). Bare IPs behave as /32. Invalid prefixes are
+        // skipped silently.
         // Split "a.b.c.d/n" — bare IPs (no slash) are accepted as /32.
-        let (ip_part, _prefix) = match line.split_once('/') {
-            Some((ip, _pfx)) => (ip.trim(), Some(())),
-            None => (line, None),
+        let (ip_part, prefix): (&str, u8) = match line.split_once('/') {
+            Some((ip, pfx)) => {
+                let p: u8 = match pfx.trim().parse() {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                if p > 32 {
+                    continue;
+                }
+                (ip.trim(), p)
+            }
+            None => (line, 32),
         };
-        let net: Ipv4Addr = match ip_part.parse() {
+        let addr: Ipv4Addr = match ip_part.parse() {
             Ok(ip) => ip,
             Err(_) => continue, // FIX(WP0.2): skip invalid lines silently
         };
+        let ip_u32 = u32::from(addr);
+        let mask: u32 = if prefix == 0 {
+            0
+        } else {
+            (!0u32) << (32 - prefix)
+        };
+        let network = ip_u32 & mask;
         // First usable = network + 1 (e.g. 104.16.0.0/24 → 104.16.0.1).
         // For a /32 host address the address itself is usable.
-        let first = if line.contains('/') {
-            let n = u32::from(net).wrapping_add(1);
-            Ipv4Addr::from(n)
+        let first = if prefix == 32 {
+            addr
+        } else if prefix == 31 {
+            Ipv4Addr::from(network)
         } else {
-            net
+            Ipv4Addr::from(network.wrapping_add(1))
         };
         let entry = (first.to_string(), 443u16);
         if !out.contains(&entry) {

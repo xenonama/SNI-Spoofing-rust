@@ -34,33 +34,16 @@ export default function ProxyPage() {
         </div>
       </Section>
 
+      {/* FIX(#1b): engine is raw TCP; Xray owns SOCKS5/HTTP. Static text replaces dead inputs. */}
       <Section title="Proxy output">
-        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-          <label className="flex flex-col gap-1.5">
-            <span className="label">SOCKS5 port</span>
-            <input
-              className="input font-mono"
-              inputMode="numeric"
-              value={cfg.SOCKS5_PORT}
-              onChange={(e) => {
-                const n = parseInt(e.target.value, 10);
-                if (!Number.isNaN(n)) patch({ SOCKS5_PORT: n });
-              }}
-            />
-          </label>
-          <label className="flex flex-col gap-1.5">
-            <span className="label">HTTP port</span>
-            <input
-              className="input font-mono"
-              inputMode="numeric"
-              value={cfg.HTTP_PORT}
-              onChange={(e) => {
-                const n = parseInt(e.target.value, 10);
-                if (!Number.isNaN(n)) patch({ HTTP_PORT: n });
-              }}
-            />
-          </label>
-        </div>
+        <p className="text-sm text-muted leading-relaxed">
+          The engine listens on a single raw TCP port
+          (<span className="font-mono text-white">LISTEN_PORT</span>, default
+          40443). Point your external Xray / Trojan client at that port; Xray
+          exposes the SOCKS5 and HTTP listeners on the ports configured in
+          its own inbound. The engine does not speak SOCKS5 or HTTP CONNECT
+          itself.
+        </p>
       </Section>
 
       <Section title="Trojan transport">

@@ -14,9 +14,9 @@
 
 use sni_core::{
     config::{Config, Endpoint},
+    fake_tcp::BypassMethod,
     picker::{build_quic_filter, build_tcp_filter, ep_key, pick_sni, EndpointPicker},
     stats::Stats,
-    tls::{build_fake_client_hello, TlsProfile},
 };
 use parking_lot::Mutex as ParkMutex;
 use serde::Serialize;
@@ -57,6 +57,98 @@ struct ActiveRelay {
     started: Instant,
 }
 
+/// FIX(#3b): guarantees `decrement_active` and `active_relays.remove`
+/// run even if `handle()` panics or is cancelled mid-relay. Armed
+/// once, right after the `increment_active` / `active_relays.insert`,
+/// so any subsequent `.await` is protected.
+struct ActiveGuard {
+    stats: Arc<Stats>,
+    relays: Arc<ParkMutex<HashMap<ConnId, ActiveRelay>>>,
+    // FIX(#6): per-connection resolved-method record, cleaned on drop.
+    resolved_methods: Arc<ParkMutex<HashMap<ConnId, String>>>,
+    id: ConnId,
+}
+
+impl Drop for ActiveGuard {
+    fn drop(&mut self) {
+        self.stats.decrement_active();
+        self.relays.lock().remove(&self.id);
+        // FIX(#6): also drop the per-connection resolved-method record.
+        self.resolved_methods.lock().remove(&self.id);
+    }
+}
+
+/// FIX(#7): adaptive method selection for the "auto" config.
+/// Starts on a random real method and sticks to it for a window
+/// of connections or time. Rotates when the current method is
+/// failing or a budget is exhausted, so the engine can discover
+/// which method works on the current network without paying the
+/// old "random per connection" penalty.
+pub struct AutoState {
+    pub current: BypassMethod,
+    pub attempts: u32,
+    pub failures: u32,
+    pub started_at: Instant,
+}
+
+impl AutoState {
+    /// Rotate after this many connections on the same method.
+    pub const MAX_ATTEMPTS: u32 = 10;
+    /// Rotate after this many failures on the same method.
+    pub const MAX_FAILURES: u32 = 3;
+    /// Rotate after this many seconds on the same method.
+    pub const MAX_SECS: u64 = 60;
+
+    pub fn new() -> Self {
+        // BypassMethod::Auto.resolve() returns a random real method
+        // (see core/src/fake_tcp.rs). We reuse that pool so the
+        // two systems stay in sync.
+        Self {
+            current: BypassMethod::Auto.resolve(),
+            attempts: 0,
+            failures: 0,
+            started_at: Instant::now(),
+        }
+    }
+
+    /// Record one connection outcome. Returns `true` when the
+    /// caller should rotate the current method.
+    pub fn record(&mut self, success: bool) -> bool {
+        self.attempts = self.attempts.saturating_add(1);
+        if !success {
+            self.failures = self.failures.saturating_add(1);
+        }
+        self.failures >= Self::MAX_FAILURES
+            || self.attempts >= Self::MAX_ATTEMPTS
+            || self.started_at.elapsed().as_secs() >= Self::MAX_SECS
+    }
+
+    /// Pick a fresh random real method, avoiding `self.current`.
+    /// A couple of retries is enough — the pool has 9 entries.
+    pub fn rotate(&mut self) {
+        let previous = self.current;
+        let mut next = BypassMethod::Auto.resolve();
+        for _ in 0..3 {
+            if next != previous {
+                break;
+            }
+            next = BypassMethod::Auto.resolve();
+        }
+        tracing::info!(
+            "auto: rotating method {} -> {} (attempts={} failures={} elapsed={}s)",
+            previous.as_str(),
+            next.as_str(),
+            self.attempts,
+            self.failures,
+            self.started_at.elapsed().as_secs()
+        );
+        self.current = next;
+        self.attempts = 0;
+        self.failures = 0;
+        self.started_at = Instant::now();
+    }
+}
+
 /// Per-connection entry (subset of `FakeInjectiveConnection` needed by the
 /// orchestrator; sockets stay owned by `handle()` tasks).
 pub struct ConnEntry {
@@ -64,6 +156,10 @@ pub struct ConnEntry {
     pub id: ConnId,
     pub created_at: Instant,
     pub monitor: AtomicBool,
+    // FIX(stats): `counted` is now redundant for the relay-outcome path
+    // (verdict comes from bytes moved, not the handshake flag). Kept for
+    // compat; allow dead_code so the leftover store(true) never warns.
+    #[allow(dead_code)]
     pub counted: AtomicBool,
     pub method: String,
     pub sni: String,
@@ -111,6 +207,22 @@ pub struct Worker {
     // layer can snapshot without a Tokio runtime. Inserted before relay,
     // removed after; replaced per connection, never appended (D2: no leak).
     active_relays: Arc<ParkMutex<HashMap<ConnId, ActiveRelay>>>,
+    // FIX(perf): sync mirror of `conns` for the DPI fast-path guard.
+    // The capture thread (std::thread) cannot await the tokio Mutex,
+    // and try_lock() on it was unreliable under contention. A
+    // parking_lot Mutex<HashSet<ConnId>> is lock-free enough for the
+    // read-heavy fast path.
+    pub dpi_conns: Arc<ParkMutex<std::collections::HashSet<ConnId>>>,
+    /// FIX(#7): adaptive state for the "auto" config. Unused when
+    /// bypass_method is a concrete method, but always constructed so
+    /// a live config change can flip into auto without a restart.
+    pub auto_state: Arc<ParkMutex<AutoState>>,
+    /// FIX(#6): resolved method per active connection. When config is
+    /// "auto", the DPI state machine resolved it to one of the real
+    /// methods per connection. This map records that choice so stats
+    /// can rank the actual method instead of the useless "auto"
+    /// placeholder. Cleaned up by ActiveGuard.
+    pub resolved_methods: Arc<ParkMutex<HashMap<ConnId, String>>>,
 }
 
 impl Worker {
@@ -133,6 +245,11 @@ impl Worker {
             shutdown: Arc::new(Notify::new()),
             interface_ipv4: iface,
             active_relays: Arc::new(ParkMutex::new(HashMap::new())),
+            // FIX: init sync mirror for DPI fast-path guard.
+            dpi_conns: Arc::new(ParkMutex::new(std::collections::HashSet::new())),
+            // FIX(#7): sticky-auto state + per-connection resolved methods.
+            auto_state: Arc::new(ParkMutex::new(AutoState::new())),
+            resolved_methods: Arc::new(ParkMutex::new(HashMap::new())),
         })
     }
 
@@ -152,6 +269,46 @@ impl Worker {
 
     pub fn quic_filter(&self) -> String {
         build_quic_filter(&self.interface_ipv4)
+    }
+
+    // FIX(perf): sync fast-path check for the DPI dispatch guard. Uses the
+    // existing `active_relays` table (sync parking_lot, lives for the whole
+    // relay) so the capture thread can test membership without a Tokio
+    // runtime. `conns` cannot be used here: it is a tokio Mutex (no sync
+    // lock from a std thread) and it is evicted before relay starts.
+    pub fn is_known_relay(&self, id: &ConnId) -> bool {
+        self.active_relays.lock().contains_key(id)
+    }
+
+    /// FIX(#7): returns the concrete method this connection should
+    /// use. For a non-auto config this is just the config method. For
+    /// "auto" it is the current sticky method from `auto_state`.
+    pub fn resolve_method_for_connection(&self, cfg_method: BypassMethod) -> BypassMethod {
+        match cfg_method {
+            BypassMethod::Auto => self.auto_state.lock().current,
+            other => other,
+        }
+    }
+
+    /// FIX(#7): record a connection outcome and rotate the sticky
+    /// method if the auto budget is spent. No-op when the config is
+    /// not "auto".
+    pub fn record_connection_result(&self, cfg_method: BypassMethod, success: bool) {
+        if !matches!(cfg_method, BypassMethod::Auto) {
+            return;
+        }
+        let mut st = self.auto_state.lock();
+        if st.record(success) {
+            st.rotate();
+        }
+    }
+
+    /// FIX(#6): called by the DPI dispatch when it commits to a fake
+    /// burst, so stats later record the actual resolved method.
+    pub fn record_resolved_method(&self, id: &ConnId, method: &str) {
+        self.resolved_methods
+            .lock()
+            .insert(id.clone(), method.to_string());
     }
 
     /// Sync snapshot of live relay sessions for the U5 Active Connections
@@ -234,8 +391,9 @@ impl Worker {
             self.stats.increment_failed();
             return;
         }
-        let profile = TlsProfile::parse(&self.config.tls_fingerprint).unwrap_or(TlsProfile::Legacy);
-        let _fake_hello = build_fake_client_hello(sni.as_bytes(), profile);
+        // FIX P2: wire decoy is built in engine.rs DPI path; building another
+        // hello here was dead code (never sent) with independent randomness,
+        // causing stats-vs-wire SNI mismatch. Accounting SNI only.
 
         let ordered = self.pick_endpoints();
         if ordered.is_empty() {
@@ -250,7 +408,11 @@ impl Worker {
             Some(v) => v,
             None => {
                 // Mirrors `note_fail(None, ep_key(first), sni)`.
-                self.stats.record_result(&first_key, &sni, false, "");
+                // FIX: use the configured method so the method scoreboard
+                // sees this failure. Previously empty "" was skipped by
+                // Stats::record_result.
+                let m = self.config.bypass_method.clone();
+                self.stats.record_result(&first_key, &sni, false, &m);
                 self.stats.increment_failed();
                 return;
             }
@@ -259,6 +421,10 @@ impl Worker {
 
         // Register under the REAL endpoint (mirrors re-key on failover).
         let method = self.config.bypass_method.clone();
+        // FIX(#7): parsed method is used for both the sticky resolver
+        // and the outcome recorder.
+        let cfg_method = BypassMethod::parse(&self.config.bypass_method)
+            .unwrap_or(BypassMethod::WrongSeq);
         let local: SocketAddr = match outgoing.local_addr() {
             Ok(a) => a,
             Err(_) => {
@@ -275,8 +441,12 @@ impl Worker {
                 return;
             }
         };
+        // FIX P4: use the actual socket local IP, not interface_ipv4. On
+        // multi-route/VPN the egress IP for this endpoint can differ from the
+        // route to endpoints[0]; using iface breaks ConnId<->DpiKey matching
+        // (engine now uses WinDivert direction, so IDs must be real).
         let id: ConnId = (
-            self.interface_ipv4.clone(),
+            local_ip.clone(),
             local_port,
             connected_ep.ip.clone(),
             connected_ep.port,
@@ -288,53 +458,30 @@ impl Worker {
         self.stats.increment_total();
         self.stats.increment_active();
         entry.counted.store(true, Ordering::Relaxed);
+        // FIX: pre-register was a no-op (immediately removed). Just
+        // register the real connection id under the actual connected
+        // endpoint, which is what the DPI dispatch uses.
+        // (Preserved history: pre-register with FIRST then re-key mirrored
+        // main.py two-step, but first_id was removed right after insert.)
         {
-            // Pre-register with FIRST then re-key (mirrors main.py two-step).
             let mut map = self.conns.lock().await;
-            let first_id: ConnId = (
-                self.interface_ipv4.clone(),
-                local_port,
-                ordered[0].ip.clone(),
-                ordered[0].port,
-            );
-            map.insert(first_id.clone(), Arc::clone(&entry));
-            if first_id != id {
-                map.remove(&first_id);
-            }
             map.insert(id.clone(), Arc::clone(&entry));
         }
+        // FIX(perf): mirror to the sync-side set for the DPI fast path.
+        self.dpi_conns.lock().insert(id.clone());
 
-        // Handshake wait (mirrors `wait_for(t2a_event.wait(), TIMEOUT)`).
-        let timeout = Duration::from_secs_f64(self.config.handshake_timeout.clamp(0.5, 10.0));
-        let ok = match tokio::time::timeout(timeout, entry.wait()).await {
-            Ok(Some(true)) => true,
-            Ok(Some(false)) => false,
-            Ok(None) => false,
-            Err(_) => false, // timeout — same path as `t2a_msg != fake_data_ack_recv`
-        };
-        if !ok {
-            self.note_fail(&entry, &cur_key).await;
-            self.evict(&id).await;
-            return;
-        }
-        // Success (mirrors `record_result(..., True, method)`).
-        self.stats
-            .record_result(&cur_key, &sni, true, &entry.method);
-        // Handshake done: injector already cleared monitor; drop table entry
-        // before relay (mirrors `monitor=False; pop` before relay loops).
-        entry.monitor.store(false, Ordering::Relaxed);
-        if entry.counted.swap(false, Ordering::Relaxed) {
-            self.stats.finish_success();
-            // finish_success decrements active AND counts success; we already
-            // incremented active above, so re-increment active to keep relay
-            // accounting simple (relay close does not touch handshake stats).
-            self.stats.increment_active();
-        }
-        self.evict(&id).await;
-
+        // FIX(deadlock): start the relay IMMEDIATELY. The handshake signal
+        // (Path B: payload > 0) cannot fire before the client's real
+        // ClientHello reaches the server, which is impossible until the
+        // relay is running. Run the handshake wait CONCURRENTLY as a
+        // quality signal for stats only.
+        // (Preserved history: Handshake wait mirrors
+        // `wait_for(t2a_event.wait(), TIMEOUT)`; previously gated relay.)
+        // Register the relay session BEFORE waiting so it appears live
+        // in the Active Connections view.
         // IMPROVE(U5): register the relay session so the sync FFI snapshot
-        // sees live connections (the handshake `conns` table is evicted
-        // above by design, so it cannot serve this view).
+        // sees live connections (kept here, before relay, so the view is live
+        // during the concurrent handshake wait).
         let relay_id = id.clone();
         self.active_relays.lock().insert(
             relay_id.clone(),
@@ -346,14 +493,114 @@ impl Worker {
             },
         );
 
+        // FIX(#3b): arm the drop guard so every exit path (return, panic,
+        // cancellation) decrements active and clears the relay row.
+        let _active_guard = ActiveGuard {
+            stats: Arc::clone(&self.stats),
+            relays: Arc::clone(&self.active_relays),
+            // FIX(#6): guard also owns the resolved-method cleanup.
+            resolved_methods: Arc::clone(&self.resolved_methods),
+            id: relay_id.clone(),
+        };
+
+        // FIX(stats): the handshake signal is advisory — record it in a
+        // shared flag, but do NOT decide success/fail here. The final
+        // verdict comes from the relay outcome below.
+        // FIX(deadlock): history preserved — the handshake wait previously
+        // gated relay and did stats inline; now it only sets the advisory
+        // flag while the relay runs concurrently.
+        let hs_ok = Arc::new(AtomicBool::new(false));
+        let hs_ok_bg = Arc::clone(&hs_ok);
+        let entry_for_hs = Arc::clone(&entry);
+        let timeout = Duration::from_secs_f64(self.config.handshake_timeout.clamp(0.5, 10.0));
+        let hs_task = tokio::spawn(async move {
+            match tokio::time::timeout(timeout, entry_for_hs.wait()).await {
+                Ok(Some(true)) => {
+                    hs_ok_bg.store(true, Ordering::Relaxed);
+                    entry_for_hs.monitor.store(false, Ordering::Relaxed);
+                }
+                _ => {
+                    // Timeout or explicit fail: nothing to record here.
+                    // The relay will decide the final verdict.
+                }
+            }
+        });
+
+        // FIX(deadlock): evict the handshake conns entry (the DPI state machine
+        // no longer needs it). The spawned task holds its own Arc<ConnEntry>.
+        // (Preserved history: handshake done drops table entry before relay,
+        // mirrors `monitor=False; pop` before relay loops.)
+        self.evict(&id).await;
+        // FIX(perf): remove from the sync-side mirror as well.
+        // FIX: evict() already removes from dpi_conns; this second remove
+        // is a harmless no-op that keeps the prompt-specified symmetry.
+        self.dpi_conns.lock().remove(&id);
+
+        // FIX(stats): snapshot byte counters BEFORE the relay so we can
+        // measure how much actually flowed through this connection.
+        let bytes_before = {
+            let snap = self.stats.snapshot();
+            snap.up_bytes + snap.down_bytes
+        };
+
         // Bidirectional relay (mirrors two `relay_main_loop` tasks + peer cancel).
+        // FIX(deadlock): run the relay unconditionally.
+        // FIX(stats): run the relay unconditionally (already the case).
         relay_bidirectional(incoming, outgoing, Arc::clone(&self.stats)).await;
-        // Relay finished: release the slot (handshake success already counted).
-        self.stats.decrement_active();
+
+        // FIX(deadlock): relay done — cancel the pending handshake wait if still running.
+        hs_task.abort();
+        let _ = hs_task.await;
+
+        // FIX(stats): final verdict — bytes actually moved?
+        let bytes_after = {
+            let snap = self.stats.snapshot();
+            snap.up_bytes + snap.down_bytes
+        };
+        let bytes_moved = bytes_after.saturating_sub(bytes_before);
+        // Minimum threshold: a real TLS session will move at least a few
+        // hundred bytes. Below that, the endpoint never answered.
+        let relay_ok = bytes_moved >= 100;
+
+        // FIX(#6): prefer the DPI-resolved method (real one) over the
+        // config string. Falls back to the config string if the DPI
+        // never committed to a fake burst.
+        let method_for_stats: String = self
+            .resolved_methods
+            .lock()
+            .get(&id)
+            .cloned()
+            .unwrap_or_else(|| entry.method.clone());
+
+        if relay_ok {
+            self.stats
+                .record_result(&cur_key, &sni, true, &method_for_stats);
+            self.stats.increment_success();
+            // Handshake signal may or may not have fired — both are fine.
+            let _ = hs_ok.load(Ordering::Relaxed);
+        } else {
+            self.stats
+                .record_result(&cur_key, &sni, false, &method_for_stats);
+            self.stats.increment_failed();
+        }
+
+        // FIX(#7): tell the auto state machine about this outcome. No-op
+        // unless config is "auto".
+        self.record_connection_result(cfg_method, relay_ok);
+
+        // Clean up the per-connection method record for this id.
+        self.resolved_methods.lock().remove(&id);
+
+        // FIX(stats): single active decrement for this connection, in both
+        // branches. The success path no longer needs a compensating
+        // increment_active because we never call finish_success().
+        // Relay finished: release the slot (handshake stats already counted).
+        // FIX(#3b): explicit decrement_active + active_relays.remove removed;
+        // the ActiveGuard above handles both on scope exit (all paths).
         // IMPROVE(U5): always evict the relay record, even on early return
         // paths above this point the insert never happened, so remove is a
         // no-op there; here it prevents stale rows (D2: no leak).
-        self.active_relays.lock().remove(&relay_id);
+        // (Preserved: guard now performs this eviction.)
         // Permit (`_permit`) drops here (mirrors `conn_sem.release()`).
     }
 
@@ -374,13 +621,41 @@ impl Worker {
                 Ok(s) => s,
                 Err(_) => continue,
             };
-            let bind_addr: SocketAddr = format!("{}:0", self.interface_ipv4).parse().ok()?;
+            // FIX P4: a stale interface_ipv4 must skip this endpoint, not abort
+            // all remaining endpoints (previously `ok()?` returned None).
+            let bind_addr: SocketAddr = match format!("{}:0", self.interface_ipv4).parse() {
+                Ok(a) => a,
+                Err(_) => continue,
+            };
             if sock.bind(bind_addr).is_err() {
                 continue;
             }
+            // FIX(#2a): pre-seed the outgoing tuple in dpi_conns. The WinDivert
+            // capture thread runs concurrently and will see the SYN this
+            // socket is about to send; without the seed the fast path cannot
+            // distinguish it from foreign traffic to the same anycast IP.
+            let seeded_key: Option<ConnId> = match sock.local_addr() {
+                Ok(SocketAddr::V4(v4)) => {
+                    let k: ConnId = (
+                        v4.ip().to_string(),
+                        v4.port(),
+                        ep.ip.clone(),
+                        ep.port,
+                    );
+                    self.dpi_conns.lock().insert(k.clone());
+                    Some(k)
+                }
+                _ => None,
+            };
             match tokio::time::timeout(Duration::from_secs(5), sock.connect(target)).await {
                 Ok(Ok(stream)) => return Some((stream, ep.clone())),
-                _ => continue,
+                _ => {
+                    // FIX(#2a): drop the seed if the connect failed.
+                    if let Some(k) = seeded_key {
+                        self.dpi_conns.lock().remove(&k);
+                    }
+                    continue;
+                }
             }
         }
         // Visible at INFO (not debug) so Smart Tools / console users see
@@ -391,12 +666,16 @@ impl Worker {
     }
 
     /// Failure accounting without double-count (mirrors `note_fail`).
+    // FIX(deadlock): retained for parity/debugging; the concurrent hs_task now
+    // inlines its accounting (plus increment_active compensation), so this is
+    // currently unused — allow dead_code to keep zero warnings.
+    #[allow(dead_code)]
     async fn note_fail(&self, entry: &ConnEntry, endpoint_key: &str) {
         self.stats
             .record_result(endpoint_key, &entry.sni, false, &entry.method);
         if entry.counted.swap(false, Ordering::Relaxed) {
-            // Injector already counted via finish_failed when it saw the
-            // unexpected packet; here the engine owns it.
+            // Engine owns handshake accounting; the DPI path only signals
+            // true/false via complete_handshake and never touches Stats.
             entry.monitor.store(false, Ordering::Relaxed);
             self.stats.finish_failed();
         } else {
@@ -406,6 +685,8 @@ impl Worker {
 
     async fn evict(&self, id: &ConnId) {
         self.conns.lock().await.remove(id);
+        // FIX(perf): keep the sync mirror in lockstep.
+        self.dpi_conns.lock().remove(id);
     }
 
     /// Safety net: evict stale `monitor=false` entries older than max_age.
@@ -426,6 +707,33 @@ impl Worker {
                     let reaped = before - map.len();
                     if reaped > 0 {
                         tracing::debug!("reaped {} stale connection(s)", reaped);
+                    }
+                    // FIX(#3c): mirror cleanup. dpi_conns is the sync-side read set
+                    // for the DPI fast path; active_relays drives the U5 view. Both
+                    // can accumulate stale rows if the guard path was skipped.
+                    // `active_relays` should always be paired with a live `conns`
+                    // entry (the guard removes it), so any orphan is a leak.
+                    drop(map); // release conns lock before taking dpi_conns / relays
+                    {
+                        let live: std::collections::HashSet<ConnId> = {
+                            let map = self.conns.lock().await;
+                            map.keys().cloned().collect()
+                        };
+                        // Also keep any ConnId that still appears in active_relays as
+                        // long as the relay is young (< max_age). We do not have a
+                        // started-at here; instead we treat "present in active_relays"
+                        // as still-live and only remove dpi_conns entries that are
+                        // absent from both.
+                        let live_relays: std::collections::HashSet<ConnId> = {
+                            self.active_relays.lock().keys().cloned().collect()
+                        };
+                        let mut dpi = self.dpi_conns.lock();
+                        let before = dpi.len();
+                        dpi.retain(|k| live.contains(k) || live_relays.contains(k));
+                        let reaped = before - dpi.len();
+                        if reaped > 0 {
+                            tracing::debug!("reaped {} stale dpi_conns entry(ies)", reaped);
+                        }
                     }
                 }
             }
@@ -462,43 +770,72 @@ impl Worker {
 /// Mirrors two `relay_main_loop` tasks (`up` clients->net, `down` net->clients)
 /// with peer-cancel on EOF/error.
 async fn relay_bidirectional(incoming: TcpStream, outgoing: TcpStream, stats: Arc<Stats>) {
+    // FIX(#3a): read-idle timeout (5 minutes). Without it a half-open or
+    // keep-alive connection with no traffic pins handle() forever and leaks Active.
+    const RELAY_IDLE_SECS: u64 = 300;
     let (mut ri, mut wi) = incoming.into_split();
     let (mut ro, mut wo) = outgoing.into_split();
     let s_up = Arc::clone(&stats);
     let s_down = Arc::clone(&stats);
-    let up = tokio::spawn(async move {
-        let mut buf = vec![0u8; 65575];
+    // FIX P4: 16k buffers (was 64k x2 per conn, ~25MB churn at 200 conns);
+    // still well above MSS, far less allocator pressure.
+    // FIX P4: propagate FIN via shutdown(Write) on clean EOF so teardown is
+    // graceful instead of RST-prone drop.
+    // FIX(#3a): read-idle timeout. A half-open peer or keep-alive
+    // with no traffic for RELAY_IDLE_SECS ends the relay so the
+    // handler can decrement_active and clear active_relays.
+    let mut up = tokio::spawn(async move {
+        let mut buf = vec![0u8; 16384];
+        let idle = Duration::from_secs(RELAY_IDLE_SECS);
         loop {
-            match ri.read(&mut buf).await {
-                Ok(0) => break,
-                Ok(n) => {
+            match tokio::time::timeout(idle, ri.read(&mut buf)).await {
+                Ok(Ok(0)) => {
+                    let _ = wo.shutdown().await;
+                    break;
+                }
+                Ok(Ok(n)) => {
                     s_up.add_traffic(n as u64, 0);
                     if wo.write_all(&buf[..n]).await.is_err() {
                         break;
                     }
                 }
-                Err(_) => break,
+                Ok(Err(_)) | Err(_) => break,
             }
         }
     });
-    let down = tokio::spawn(async move {
-        let mut buf = vec![0u8; 65575];
+    // FIX(#3a): read-idle timeout. A half-open peer or keep-alive
+    // with no traffic for RELAY_IDLE_SECS ends the relay so the
+    // handler can decrement_active and clear active_relays.
+    let mut down = tokio::spawn(async move {
+        let mut buf = vec![0u8; 16384];
+        let idle = Duration::from_secs(RELAY_IDLE_SECS);
         loop {
-            match ro.read(&mut buf).await {
-                Ok(0) => break,
-                Ok(n) => {
+            match tokio::time::timeout(idle, ro.read(&mut buf)).await {
+                Ok(Ok(0)) => {
+                    let _ = wi.shutdown().await;
+                    break;
+                }
+                Ok(Ok(n)) => {
                     s_down.add_traffic(0, n as u64);
                     if wi.write_all(&buf[..n]).await.is_err() {
                         break;
                     }
                 }
-                Err(_) => break,
+                Ok(Err(_)) | Err(_) => break,
             }
         }
     });
+    // FIX 3: abort the loser task as soon as one direction ends so half-open
+    // sockets and tasks cannot leak under load (mirrors peer_task.cancel()).
     // First direction to finish wins (mirrors peer_task.cancel()).
     tokio::select! {
-        _ = up => {},
-        _ = down => {},
+        _ = &mut up => {
+            down.abort();
+            let _ = down.await;
+        }
+        _ = &mut down => {
+            up.abort();
+            let _ = up.await;
+        }
     }
 }

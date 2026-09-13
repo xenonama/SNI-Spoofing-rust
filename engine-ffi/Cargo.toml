@@ -1,5 +1,5 @@
 [package]
-name = "sni-engine-ffi"
+name = "sni-engine"
 version = "2.0.0"
 edition = "2021"
 description = "C ABI wrapper around the SNI spoofer engine for Wails/purego"

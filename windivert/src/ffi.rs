@@ -30,32 +30,63 @@ mod inner {
     pub const WINDIVERT_SHUTDOWN_SEND: c_int = 1;
     pub const WINDIVERT_SHUTDOWN_BOTH: c_int = 2;
 
+    // FIX: WINDIVERT_DIRECTION_* are deprecated — direction now comes from
+    // `addr.outbound()` (bit 17 of layer_event_bits). Kept for compat only.
+    #[allow(dead_code)]
     pub const WINDIVERT_DIRECTION_OUTBOUND: u8 = 0;
+    #[allow(dead_code)]
     pub const WINDIVERT_DIRECTION_INBOUND: u8 = 1;
 
-    /// Mirrors `WINDIVERT_ADDRESS` (WinDivert 2.2). `repr(C)` lets the compiler
-    /// insert the same 5-byte pad before `timestamp` as the C header.
+    /// WinDivert 2.2 `WINDIVERT_ADDRESS` (NETWORK layer view).
+    /// The bitfield UINT32 at offset 8 packs Layer/Event/Sniffed/Outbound/
+    /// Loopback/Impostor/IPv6/checksum bits. Direction is bit 17
+    /// (`Outbound`). The union at offset 12 carries IfIdx/SubIfIdx for
+    /// the NETWORK layer.
+    // FIX: corrected struct layout to match WinDivert 2.2 windivert.h
+    // (Timestamp:INT64 + Layer/Event bitfield:UINT32 + IfIdx + SubIfIdx).
     #[repr(C)]
-    #[derive(Debug, Clone, Copy)]
+    #[derive(Debug, Clone, Copy, Default)]
     pub struct WindivertAddress {
+        /// Wall-clock timestamp in nanoseconds (WinDivert 2.2).
+        pub timestamp: i64,
+        /// Packed bitfield: Layer:8 | Event:8 | Sniffed:1 | Outbound:1 |
+        /// Loopback:1 | Impostor:1 | IPv6:1 | IPChecksum:1 | TCPChecksum:1 |
+        /// UDPChecksum:1 | Reserved1:8 | Reserved2:16.
+        pub layer_event_bits: u32,
+        /// Interface index (NETWORK layer union member).
         pub if_idx: u32,
+        /// Sub-interface index (NETWORK layer union member).
         pub sub_if_idx: u32,
-        pub direction: u8,
-        pub loopback: u8,
-        pub impostor: u8,
-        pub timestamp: u64,
     }
 
-    impl Default for WindivertAddress {
-        fn default() -> Self {
-            Self {
-                if_idx: 0,
-                sub_if_idx: 0,
-                direction: WINDIVERT_DIRECTION_OUTBOUND,
-                loopback: 0,
-                impostor: 0,
-                timestamp: 0,
-            }
+    impl WindivertAddress {
+        #[inline]
+        pub fn layer(&self) -> u8 {
+            (self.layer_event_bits & 0xFF) as u8
+        }
+        #[inline]
+        pub fn event(&self) -> u8 {
+            ((self.layer_event_bits >> 8) & 0xFF) as u8
+        }
+        #[inline]
+        pub fn sniffed(&self) -> bool {
+            (self.layer_event_bits >> 16) & 1 != 0
+        }
+        #[inline]
+        pub fn outbound(&self) -> bool {
+            (self.layer_event_bits >> 17) & 1 != 0
+        }
+        #[inline]
+        pub fn loopback(&self) -> bool {
+            (self.layer_event_bits >> 18) & 1 != 0
+        }
+        #[inline]
+        pub fn impostor(&self) -> bool {
+            (self.layer_event_bits >> 19) & 1 != 0
+        }
+        #[inline]
+        pub fn ipv6(&self) -> bool {
+            (self.layer_event_bits >> 20) & 1 != 0
         }
     }
 
@@ -293,20 +324,66 @@ pub mod stub {
     //! Every operation returns `UnsupportedPlatform` (mirrors Python's
     //! `RuntimeError: pydivert/WinDivert not available`).
 
+    /// WinDivert 2.2 `WINDIVERT_ADDRESS` (NETWORK layer view).
+    /// The bitfield UINT32 at offset 8 packs Layer/Event/Sniffed/Outbound/
+    /// Loopback/Impostor/IPv6/checksum bits. Direction is bit 17
+    /// (`Outbound`). The union at offset 12 carries IfIdx/SubIfIdx for
+    /// the NETWORK layer.
+    // FIX: corrected stub layout to mirror WinDivert 2.2 windivert.h
+    // (same fields as the Windows real struct so review builds typecheck).
     #[derive(Debug, Clone, Copy, Default)]
     pub struct WindivertAddress {
+        /// Wall-clock timestamp in nanoseconds (WinDivert 2.2).
+        pub timestamp: i64,
+        /// Packed bitfield: Layer:8 | Event:8 | Sniffed:1 | Outbound:1 |
+        /// Loopback:1 | Impostor:1 | IPv6:1 | IPChecksum:1 | TCPChecksum:1 |
+        /// UDPChecksum:1 | Reserved1:8 | Reserved2:16.
+        pub layer_event_bits: u32,
+        /// Interface index (NETWORK layer union member).
         pub if_idx: u32,
+        /// Sub-interface index (NETWORK layer union member).
         pub sub_if_idx: u32,
-        pub direction: u8,
-        pub loopback: u8,
-        pub impostor: u8,
-        pub timestamp: u64,
+    }
+
+    impl WindivertAddress {
+        #[inline]
+        pub fn layer(&self) -> u8 {
+            (self.layer_event_bits & 0xFF) as u8
+        }
+        #[inline]
+        pub fn event(&self) -> u8 {
+            ((self.layer_event_bits >> 8) & 0xFF) as u8
+        }
+        #[inline]
+        pub fn sniffed(&self) -> bool {
+            (self.layer_event_bits >> 16) & 1 != 0
+        }
+        #[inline]
+        pub fn outbound(&self) -> bool {
+            (self.layer_event_bits >> 17) & 1 != 0
+        }
+        #[inline]
+        pub fn loopback(&self) -> bool {
+            (self.layer_event_bits >> 18) & 1 != 0
+        }
+        #[inline]
+        pub fn impostor(&self) -> bool {
+            (self.layer_event_bits >> 19) & 1 != 0
+        }
+        #[inline]
+        pub fn ipv6(&self) -> bool {
+            (self.layer_event_bits >> 20) & 1 != 0
+        }
     }
 
     pub const WINDIVERT_LAYER_NETWORK: i32 = 0;
     pub const WINDIVERT_SHUTDOWN_RECV: i32 = 0;
     pub const WINDIVERT_SHUTDOWN_BOTH: i32 = 2;
+    // FIX: WINDIVERT_DIRECTION_* are deprecated — direction now comes from
+    // `addr.outbound()` (bit 17 of layer_event_bits). Kept for compat only.
+    #[allow(dead_code)]
     pub const WINDIVERT_DIRECTION_OUTBOUND: u8 = 0;
+    #[allow(dead_code)]
     pub const WINDIVERT_DIRECTION_INBOUND: u8 = 1;
 }
 #[cfg(not(windows))]

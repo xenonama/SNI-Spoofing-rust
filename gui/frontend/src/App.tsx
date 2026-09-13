@@ -3,6 +3,7 @@ import { useAppStore } from "./stores/appStore";
 import Header from "./components/Header";
 import Sidebar from "./components/Sidebar";
 import Console from "./components/Console";
+import ConfirmModal from "./components/ConfirmModal";
 import BypassPage from "./pages/BypassPage";
 import ProxyPage from "./pages/ProxyPage";
 import ToolsPage from "./pages/ToolsPage";
@@ -161,6 +162,7 @@ export default function App() {
         </main>
       </div>
       <Notice />
+      <ConfirmModal />
     </div>
   );
 }

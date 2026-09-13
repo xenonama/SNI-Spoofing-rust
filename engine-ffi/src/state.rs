@@ -25,6 +25,9 @@ pub struct EngineState {
     pub engine: Option<crate::engine::EngineHandle>,
     pub config_path: PathBuf,
     pub held_port: Option<u16>,
+    // FIX 1: store the single-instance mutex handle (raw HANDLE as usize) so
+    // it can be closed on start-failure or Stop instead of leaking via forget.
+    pub held_mutex: Option<usize>,
     pub probe_results: Vec<ProbeResult>,
     pub sni_results: Vec<SniProbeResult>,
     pub logs: Vec<String>,
@@ -38,6 +41,7 @@ impl EngineState {
             engine: None,
             config_path,
             held_port: None,
+            held_mutex: None,
             probe_results: Vec::new(),
             sni_results: Vec::new(),
             logs: Vec::new(),

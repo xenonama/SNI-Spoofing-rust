@@ -171,11 +171,11 @@ fn err_json(msg: impl Into<String>) -> *mut c_char {
 /// Single-instance guard per listen port (Windows).
 /// The only OS-handle `unsafe` in this crate besides C string handling.
 #[cfg(windows)]
-fn acquire_single_instance(port: u16) -> anyhow::Result<()> {
+fn acquire_single_instance(port: u16) -> Result<usize, String> {
     use windows::{
         core::PCWSTR,
         Win32::{
-            Foundation::{GetLastError, ERROR_ALREADY_EXISTS},
+            Foundation::{CloseHandle, GetLastError, HANDLE, ERROR_ALREADY_EXISTS},
             System::Threading::CreateMutexW,
         },
     };
@@ -184,27 +184,44 @@ fn acquire_single_instance(port: u16) -> anyhow::Result<()> {
     // SAFETY: `wide` outlives the call; string copied by OS.
     let res = unsafe { CreateMutexW(None, true, PCWSTR(wide.as_ptr())) };
     match res {
-        Ok(_handle) => {
-            // Intentionally leaked: the mutex must live for the process
-            // lifetime. (Old Slint build did the same via `let _ = handle`.)
-            std::mem::forget(_handle);
+        Ok(handle) => {
+            // FIX 1: extract the raw HANDLE value (HANDLE is Copy with no
+            // Drop, so the OS mutex stays alive); ownership moves to the
+            // caller, which stores it in state.held_mutex and closes it on
+            // failure/Stop.
+            let raw = handle.0 as usize;
+            let _ = handle;
             // SAFETY: GetLastError immediately after the call is valid.
             let already = unsafe { GetLastError() } == ERROR_ALREADY_EXISTS;
             if already {
-                return Err(anyhow::anyhow!(
+                // FIX 1: duplicate handle from an already-owned mutex must be
+                // closed immediately to avoid leaking a handle on contention.
+                unsafe {
+                    let _ = CloseHandle(HANDLE(raw as *mut _));
+                }
+                return Err(format!(
                     "another SNI backend is already running for port {}. Stop it first.",
                     port
                 ));
             }
-            Ok(())
+            Ok(raw)
         }
-        Err(e) => Err(anyhow::anyhow!("single-instance mutex failed: {:?}", e)),
+        Err(e) => Err(format!("single-instance mutex failed: {:?}", e)),
+    }
+}
+
+#[cfg(windows)]
+fn close_single_instance(handle: usize) {
+    use windows::Win32::Foundation::{CloseHandle, HANDLE};
+    // SAFETY: handle came from CreateMutexW via acquire_single_instance.
+    unsafe {
+        let _ = CloseHandle(HANDLE(handle as *mut _));
     }
 }
 
 #[cfg(not(windows))]
-fn acquire_single_instance(_port: u16) -> anyhow::Result<()> {
-    Ok(())
+fn acquire_single_instance(_port: u16) -> Result<usize, String> {
+    Ok(0)
 }
 
 fn is_admin_inner() -> bool {
@@ -245,8 +262,9 @@ fn config_to_json(cfg: &Config) -> serde_json::Value {
         "MODE": cfg.mode,
         "PROBE_TRIES": cfg.probe_tries,
         "PROBE_TIMEOUT": cfg.probe_timeout,
-        "SOCKS5_PORT": cfg.socks5_port,
-        "HTTP_PORT": cfg.http_port,
+        // FIX(#1a): SOCKS5_PORT/HTTP_PORT removed from output. The engine is a
+        // raw TCP forwarder; those fields never bound a listener and misled
+        // users. Kept in Rust Config for backward compat on load.
     })
 }
 
@@ -309,22 +327,51 @@ pub extern "C" fn sni_start_engine(config_json: *const c_char) -> *mut c_char {
             let st = state::global().lock();
             st.held_port != Some(port)
         };
-        if need_mutex {
-            #[cfg(windows)]
-            {
-                acquire_single_instance(port).map_err(|e| e.to_string())?;
-            }
-        }
+        // FIX 1: hold the mutex handle locally until start succeeds; on
+        // failure it is closed immediately so retries on the same port work.
+        #[cfg(windows)]
+        let pending_mutex: Option<usize> = if need_mutex {
+            Some(acquire_single_instance(port)?)
+        } else {
+            None
+        };
+        #[cfg(not(windows))]
+        let pending_mutex: Option<usize> = {
+            let _ = need_mutex;
+            None
+        };
         let stats = { std::sync::Arc::clone(&state::global().lock().stats) };
         match engine::EngineHandle::start(cfg, stats) {
             Ok(h) => {
                 let mut st = state::global().lock();
                 st.engine = Some(h);
                 st.engine_started = Some(std::time::Instant::now());
-                st.held_port = Some(port);
+                // FIX 1: only store the freshly acquired handle on success.
+                if let Some(raw) = pending_mutex {
+                    #[cfg(windows)]
+                    {
+                        st.held_mutex = Some(raw);
+                        st.held_port = Some(port);
+                    }
+                    #[cfg(not(windows))]
+                    {
+                        let _ = raw;
+                        st.held_port = Some(port);
+                    }
+                } else if st.held_port.is_none() {
+                    st.held_port = Some(port);
+                }
                 Ok(())
             }
-            Err(e) => Err(e),
+            Err(e) => {
+                // FIX 1: start failed after acquire — release the mutex so
+                // the port is not locked for the process lifetime.
+                #[cfg(windows)]
+                if let Some(raw) = pending_mutex {
+                    close_single_instance(raw);
+                }
+                Err(e)
+            }
         }
     });
     match res {
@@ -357,9 +404,27 @@ pub extern "C" fn sni_stop_engine() -> *mut c_char {
             h.shutdown();
             st.engine_started = None;
             st.stats.reset();
+            // FIX 1: release the single-instance mutex handle.
+            // FIX 2: reset held_port so the next Start on a different port
+            // acquires cleanly instead of orphaning the old handle.
+            if let Some(raw) = st.held_mutex.take() {
+                #[cfg(windows)]
+                close_single_instance(raw);
+                #[cfg(not(windows))]
+                let _ = raw;
+            }
+            st.held_port = None;
             true
         } else {
             st.engine_started = None;
+            // FIX 2: idle Stop still clears stale port/mutex state.
+            if let Some(raw) = st.held_mutex.take() {
+                #[cfg(windows)]
+                close_single_instance(raw);
+                #[cfg(not(windows))]
+                let _ = raw;
+            }
+            st.held_port = None;
             false
         }
     });

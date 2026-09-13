@@ -61,11 +61,15 @@ func main() {
 		},
 	})
 	app.Window.NewWithOptions(application.WebviewWindowOptions{
- 		Title:  "SNI Spoofer",
- 		Width:  1180,
- 		Height: 780,
- 		MinWidth:  900,
- 		MinHeight: 620,
+		Title:  "SNI Spoofer",
+		Width:  1180,
+		Height: 780,
+		MinWidth:  900,
+		MinHeight: 620,
+		// Disable the WebView2 default right-click menu (Back / Refresh /
+		// Save as / Print / Inspect) so the window feels like a desktop
+		// tool, not a browser.
+		DefaultContextMenuDisabled: true,
 	})
 	if err := app.Run(); err != nil {
 		log.Fatal(err)
