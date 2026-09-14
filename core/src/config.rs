@@ -36,6 +36,8 @@ pub const SUPPORTED_FINGERPRINTS: &[&str] = &[
 
 pub const SUPPORTED_QUIC_MODES: &[&str] = &["block", "spoof", "passthrough"];
 pub const SUPPORTED_MODES: &[&str] = &["SNI Only", "Trojan + Xray"];
+// FIX #8: address family selection modes.
+pub const SUPPORTED_IP_MODES: &[&str] = &["ipv4", "ipv6", "both"];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Endpoint {
@@ -58,6 +60,12 @@ pub struct Config {
     pub padding_size: u8,
     pub quic_mode: String,
     pub mode: String,
+    /// FIX #8: address family selection.
+    #[serde(default = "default_ip_mode")]
+    pub ip_mode: String,
+    // FIX(#3): tray on/off toggle (takes effect on next launch).
+    #[serde(default = "default_tray_enabled")]
+    pub tray_enabled: bool,
     // GUI extras (live in config.json.full.json on Python side).
     #[serde(default = "default_probe_tries")]
     pub probe_tries: u32,
@@ -81,6 +89,14 @@ fn default_socks_port() -> u16 {
 fn default_http_port() -> u16 {
     10809
 }
+// FIX #8: default address family is IPv4-only bypass.
+fn default_ip_mode() -> String {
+    "ipv4".to_string()
+}
+// FIX(#3): tray defaults to on.
+fn default_tray_enabled() -> bool {
+    true
+}
 
 impl Default for Config {
     fn default() -> Self {
@@ -100,6 +116,10 @@ impl Default for Config {
             padding_size: 0,
             quic_mode: "block".to_string(),
             mode: "SNI Only".to_string(),
+            // FIX #8: default to IPv4 bypass + IPv6 drop.
+            ip_mode: "ipv4".to_string(),
+            // FIX(#3): tray on by default.
+            tray_enabled: true,
             probe_tries: 2,
             probe_timeout: 3.0,
             socks5_port: 10808,
@@ -341,6 +361,26 @@ pub fn migrate(v: serde_json::Value) -> Result<Config, ConfigError> {
     if let Some(m) = get_str("MODE") {
         cfg.mode = m;
     }
+    // FIX #8: address family selection (IP_MODE / ip_mode).
+    if let Some(m) = get_str("IP_MODE").or_else(|| get_str("ip_mode")) {
+        cfg.ip_mode = m.to_lowercase();
+    }
+    // FIX(tray-rewrite): tray on/off toggle with tolerant coercion.
+    // Accepts bool, "true/false/1/0/yes/no/on/off" strings (case-insensitive,
+    // trimmed), and numbers (0=false, nonzero=true) so hand-edited configs
+    // and frontend payloads never silently misread.
+    if let Some(v) = obj.get("TRAY_ENABLED").or_else(|| obj.get("tray_enabled")) {
+        if let Some(b) = v.as_bool() {
+            cfg.tray_enabled = b;
+        } else if let Some(s) = v.as_str() {
+            let t = s.trim().to_ascii_lowercase();
+            cfg.tray_enabled = matches!(t.as_str(), "true" | "1" | "yes" | "y" | "on");
+        } else if let Some(n) = v.as_u64() {
+            cfg.tray_enabled = n != 0;
+        } else if let Some(n) = v.as_i64() {
+            cfg.tray_enabled = n != 0;
+        }
+    }
     if let Some(n) = obj
         .get("PROBE_TRIES")
         .and_then(|x| x.as_u64().map(|v| v as u32))
@@ -441,6 +481,10 @@ pub fn validate(cfg: &Config) -> Result<(), ConfigError> {
         || (cfg.socks5_port == cfg.http_port && cfg.socks5_port != 0)
     {
         errs.push("SOCKS5_PORT/HTTP_PORT must not collide with LISTEN_PORT or each other".to_string());
+    }
+    // FIX #8: address family selection must be a known mode.
+    if !SUPPORTED_IP_MODES.contains(&cfg.ip_mode.as_str()) {
+        errs.push(format!("IP_MODE must be one of {:?}", SUPPORTED_IP_MODES));
     }
     if errs.is_empty() {
         Ok(())

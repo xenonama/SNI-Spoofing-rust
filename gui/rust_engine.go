@@ -43,6 +43,7 @@ var (
 	fnGetDefaultConfig func() *byte
 	fnGetActiveConns   func() *byte
 	fnCancelProbe      func()
+	fnSetConfigPath    func(*byte)
 
 	configPathOverride string
 	configPathMu       sync.RWMutex
@@ -114,14 +115,27 @@ func loadLib() error {
 		purego.RegisterLibFunc(&fnGetDefaultConfig, libHandle, "sni_get_default_config")
 		purego.RegisterLibFunc(&fnGetActiveConns, libHandle, "sni_get_active_connections")
 		purego.RegisterLibFunc(&fnCancelProbe, libHandle, "sni_cancel_probe")
+		// FIX(tray-rewrite): optional symbol (older DLLs lack it); register
+		// best-effort so missing export does not fail the whole load.
+		func() {
+			defer func() { _ = recover() }()
+			purego.RegisterLibFunc(&fnSetConfigPath, libHandle, "sni_set_config_path")
+		}()
 	})
 	return loadErr
 }
 
-func callString(fn func(*byte) *byte, arg string) (string, error) {
+// FIX(ffi-first-call): fn pointers are populated lazily by loadLib, so
+// callers must pass POINTERS to the fn vars — dereferenced only after
+// loadLib() runs. Passing the value directly evaluates it before the
+// load, making the first FFI call of every process fail with
+// "rust function not loaded" (masked in the GUI only because IsAdmin
+// primes the loader at startup; --self-test always failed).
+func callString(fnPtr *func(*byte) *byte, arg string) (string, error) {
 	if err := loadLib(); err != nil {
 		return "", err
 	}
+	fn := *fnPtr
 	if fn == nil {
 		return "", fmt.Errorf("rust function not loaded")
 	}
@@ -135,10 +149,11 @@ func callString(fn func(*byte) *byte, arg string) (string, error) {
 	return goString(ptr), nil
 }
 
-func callNoArg(fn func() *byte) (string, error) {
+func callNoArg(fnPtr *func() *byte) (string, error) {
 	if err := loadLib(); err != nil {
 		return "", err
 	}
+	fn := *fnPtr
 	if fn == nil {
 		return "", fmt.Errorf("rust function not loaded")
 	}
@@ -162,14 +177,14 @@ func goString(p *byte) string {
 	return string(unsafe.Slice(p, length))
 }
 
-func rustStartEngine(cfg string) (string, error)  { return callString(fnStartEngine, cfg) }
-func rustStopEngine() (string, error)             { return callNoArg(fnStopEngine) }
-func rustGetStats() (string, error)               { return callNoArg(fnGetStats) }
-func rustGetLogs() (string, error)                { return callNoArg(fnGetLogs) }
-func rustClearLogs() (string, error)              { return callNoArg(fnClearLogs) }
-func rustExportLogs() (string, error)             { return callNoArg(fnExportLogs) }
+func rustStartEngine(cfg string) (string, error) { return callString(&fnStartEngine, cfg) }
+func rustStopEngine() (string, error)            { return callNoArg(&fnStopEngine) }
+func rustGetStats() (string, error)              { return callNoArg(&fnGetStats) }
+func rustGetLogs() (string, error)               { return callNoArg(&fnGetLogs) }
+func rustClearLogs() (string, error)             { return callNoArg(&fnClearLogs) }
+func rustExportLogs() (string, error)            { return callNoArg(&fnExportLogs) }
 func rustRunProbeEndpoints(eps string) (string, error) {
-	return callString(fnRunProbeEP, eps)
+	return callString(&fnRunProbeEP, eps)
 }
 func rustRunProbeSnis(snis, ep string) (string, error) {
 	if err := loadLib(); err != nil {
@@ -187,8 +202,8 @@ func rustRunProbeSnis(snis, ep string) (string, error) {
 	defer fnFreeString(ptr)
 	return goString(ptr), nil
 }
-func rustGetProbeResults() (string, error) { return callNoArg(fnGetProbeRes) }
-func rustGetSniResults() (string, error)   { return callNoArg(fnGetSniRes) }
+func rustGetProbeResults() (string, error) { return callNoArg(&fnGetProbeRes) }
+func rustGetSniResults() (string, error)   { return callNoArg(&fnGetSniRes) }
 func rustIsAdmin() bool {
 	if err := loadLib(); err != nil {
 		return false
@@ -198,6 +213,7 @@ func rustIsAdmin() bool {
 	}
 	return fnIsAdmin() != 0
 }
+
 // FIX(A3): backend liveness probe for the UI resync tick.
 func rustIsEngineAlive() bool {
 	if err := loadLib(); err != nil {
@@ -212,16 +228,29 @@ func rustSelfTest(configPath string) (string, error) {
 	if configPath == "" {
 		configPath = resolvedConfigPath("")
 	}
-	return callString(fnSelfTest, configPath)
+	return callString(&fnSelfTest, configPath)
 }
-func rustSaveConfig(cfg string) (string, error) { return callString(fnSaveConfig, cfg) }
-func rustLoadConfig() (string, error)           { return callNoArg(fnLoadConfig) }
+func rustSaveConfig(cfg string) (string, error) { return callString(&fnSaveConfig, cfg) }
+func rustLoadConfig() (string, error)           { return callNoArg(&fnLoadConfig) }
 
 // FIX(WP0.2C): seeded first-launch defaults from ip_list.txt/sni_list.txt.
-func rustGetDefaultConfig() (string, error) { return callNoArg(fnGetDefaultConfig) }
+func rustGetDefaultConfig() (string, error) { return callNoArg(&fnGetDefaultConfig) }
+
+// FIX(tray-rewrite): sync Go's --config override into the Rust global so
+// save/load and the tray gate read the same file. No-op on older DLLs.
+func rustSetConfigPath(p string) {
+	if err := loadLib(); err != nil {
+		return
+	}
+	if fnSetConfigPath == nil {
+		return
+	}
+	cArg := append([]byte(p), 0)
+	fnSetConfigPath(&cArg[0])
+}
 
 // IMPROVE(U5): live relay sessions for the Active Connections view.
-func rustGetActiveConnections() (string, error) { return callNoArg(fnGetActiveConns) }
+func rustGetActiveConnections() (string, error) { return callNoArg(&fnGetActiveConns) }
 
 // FIX(B4): cooperative probe cancellation for window-close (T3).
 func rustCancelProbe() {
@@ -234,7 +263,7 @@ func rustCancelProbe() {
 	fnCancelProbe()
 }
 func rustConfigPath() string {
-	s, err := callNoArg(fnConfigPath)
+	s, err := callNoArg(&fnConfigPath)
 	if err != nil {
 		// Fall back to the local default so the UI always shows something.
 		return toPathJSON(filepath.Join(exeDir(), "config.json"))

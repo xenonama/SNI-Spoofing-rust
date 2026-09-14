@@ -259,6 +259,10 @@ fn config_to_json(cfg: &Config) -> serde_json::Value {
         "TLS_FINGERPRINT": cfg.tls_fingerprint,
         "PADDING_SIZE": cfg.padding_size,
         "QUIC_MODE": cfg.quic_mode,
+        // FIX #8: address family selection.
+        "IP_MODE": cfg.ip_mode,
+        // FIX(#3): tray on/off toggle.
+        "TRAY_ENABLED": cfg.tray_enabled,
         "MODE": cfg.mode,
         "PROBE_TRIES": cfg.probe_tries,
         "PROBE_TIMEOUT": cfg.probe_timeout,
@@ -716,12 +720,41 @@ pub extern "C" fn sni_save_config(config_json: *const c_char) -> *mut c_char {
             // lockdown is deliberately not applied.
             let path = state::global().lock().config_path.clone();
             let val = config_to_json(&cfg);
+            let json_str = serde_json::to_string(&val).unwrap_or_default();
             match state::atomic_write_json(&path, &val) {
+                // FIX(persist): log size + critical fields so the console
+                // shows exactly what was saved.
                 Ok(()) => {
-                    state::push_log(format!("[INFO] saved {}", path.display()));
+                    state::push_log(format!(
+                        "[INFO] saved {} ({} bytes, ip_mode={}, tray={})",
+                        path.display(),
+                        json_str.len(),
+                        cfg.ip_mode,
+                        cfg.tray_enabled
+                    ));
+                    // FIX(persist): after write, verify the two recently-added
+                    // fields survived the round-trip. A missing field here means
+                    // config_to_json dropped it.
+                    if let Ok(re_read) = config::load(&path) {
+                        if re_read.ip_mode != cfg.ip_mode {
+                            state::push_log(format!(
+                                "[WARN] round-trip lost IP_MODE: wrote {:?}, read {:?}",
+                                cfg.ip_mode, re_read.ip_mode
+                            ));
+                        }
+                        if re_read.tray_enabled != cfg.tray_enabled {
+                            state::push_log(format!(
+                                "[WARN] round-trip lost TRAY_ENABLED: wrote {}, read {}",
+                                cfg.tray_enabled, re_read.tray_enabled
+                            ));
+                        }
+                    }
                     json_to_c(&serde_json::json!({"ok": true, "path": path.display().to_string()}))
                 }
-                Err(e) => err_json(format!("save failed: {}", e)),
+                Err(e) => {
+                    state::push_log(format!("[ERR] save failed: {}", e));
+                    err_json(format!("save failed: {}", e))
+                }
             }
         }
         Err(e) => err_json(format!("save failed: {}", e)),
@@ -781,6 +814,23 @@ pub extern "C" fn sni_config_path() -> *mut c_char {
     ensure_tracing();
     let path = state::global().lock().config_path.clone();
     json_to_c(&serde_json::json!({"ok": true, "path": path.display().to_string()}))
+}
+
+/// FIX(tray-rewrite): sync the Rust config path with Go's `--config`
+/// override. Without this, Go's tray gate (`resolvedConfigPath`) and the
+/// Rust save/load path diverge when `--config` is used, so the toggle
+/// appears not to stick. Empty/null resets to `<exe>/config.json`.
+#[no_mangle]
+pub extern "C" fn sni_set_config_path(config_path: *const c_char) {
+    ensure_tracing();
+    // SAFETY: valid NUL-terminated string per contract; null => reset.
+    let cp = unsafe { c_str_to_string(config_path) };
+    let path = if cp.trim().is_empty() {
+        state::EngineState::default_config_path()
+    } else {
+        std::path::PathBuf::from(cp.trim())
+    };
+    state::set_config_path(path);
 }
 
 /// Build the first-launch default config (WP0.2).

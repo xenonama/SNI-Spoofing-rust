@@ -1,5 +1,9 @@
 import { useState } from "react";
 import { useAppStore, formatBytes } from "../stores/appStore";
+// FIX #8: IP mode selector options.
+import { IP_MODES, normalizeConfig } from "../types";
+import { useConfirmStore } from "../stores/confirmStore";
+import * as api from "../api";
 import Section from "../components/Section";
 import StatCard from "../components/StatCard";
 import Button from "../components/Button";
@@ -46,6 +50,7 @@ export default function BypassPage() {
   const stop = useAppStore((s) => s.actions.stop);
   const save = useAppStore((s) => s.actions.save);
   const load = useAppStore((s) => s.actions.load);
+  const trayBusy = useAppStore((s) => s.trayBusy);
   const [busy, setBusy] = useState<string | null>(null);
   const [err, setErr] = useState<string | null>(null);
 
@@ -81,6 +86,30 @@ export default function BypassPage() {
           </Button>
           <Button disabled={busy != null} onClick={() => run("load", load)} title="Reload config (Ctrl+R)">
             Reload
+          </Button>
+          {/* FIX(#5): reset all configuration to defaults (with confirm). */}
+          <Button
+            disabled={busy != null}
+            onClick={() =>
+              run("reset", async () => {
+                const ok = await useConfirmStore.getState().confirm({
+                  title: "Reset configuration",
+                  message:
+                    "This will reset all configuration to defaults and save immediately. Continue?",
+                  confirmLabel: "Reset",
+                  danger: true,
+                });
+                if (!ok) return;
+                const defaults = await api.getDefaultConfig();
+                const parsed = typeof defaults === "string" ? JSON.parse(defaults) : defaults;
+                setConfig(normalizeConfig(parsed));
+                // immediately persist — do not wait for the debounce
+                await api.configSave(JSON.stringify(normalizeConfig(parsed)));
+              })
+            }
+            title="Reset all configuration to defaults"
+          >
+            {busy === "reset" ? "Resetting…" : "Reset to defaults"}
           </Button>
         </div>
         {err && <div className="mt-3 text-sm text-danger">{err}</div>}
@@ -215,6 +244,87 @@ export default function BypassPage() {
                 </option>
               ))}
             </select>
+          </Field>
+          {/* FIX #8: IP mode selector — forces IPv4 fallback via IPv6 drop. */}
+          <Field
+            label="IP mode"
+            hint="ipv4 = bypass IPv4, drop IPv6 so the browser falls back. ipv6 = bypass IPv6 only (IPv4 passes through). both = bypass IPv4 and drop IPv6 (full IPv6 bypass is coming)."
+          >
+            <div className="flex gap-1 p-1 rounded-lg bg-surface border border-card-edge">
+              {IP_MODES.map((m) => (
+                <button
+                  key={m}
+                  type="button"
+                  onClick={() => patch({ IP_MODE: m })}
+                  className={`flex-1 px-3 py-1.5 rounded-md text-xs font-semibold transition-colors focus:outline-none focus:ring-2 focus:ring-accent/60 ${
+                    cfg.IP_MODE === m
+                      ? "bg-accent/15 text-white"
+                      : "text-muted hover:text-white hover:bg-white/5"
+                  }`}
+                  title={
+                    m === "ipv4"
+                      ? "Bypass IPv4, drop IPv6"
+                      : m === "ipv6"
+                        ? "Bypass IPv6 only"
+                        : "Bypass IPv4, drop IPv6 (IPv6 fake burst TBD)"
+                  }
+                >
+                  {m.toUpperCase()}
+                </button>
+              ))}
+            </div>
+          </Field>
+          {/* FIX(#B): system tray runtime toggle. */}
+          {/* FIX(persist): toggle applies the tray icon immediately via
+              the runtime binding; only the close behavior needs a relaunch. */}
+          <Field
+            label="System tray"
+            hint="Runtime toggle: enabling or disabling takes effect immediately for both the tray icon and the window close behavior (hide vs quit)."
+          >
+            <div className="flex items-center justify-between gap-3">
+              <button
+                type="button"
+                role="switch"
+                aria-checked={cfg.TRAY_ENABLED}
+                disabled={trayBusy || busy != null}
+                onClick={() =>
+                  run("tray", async () => {
+                    // FIX(tray-rewrite): Go owns the disk write. Claim the
+                    // trayBusy guard so autosave + flush-on-hide skip their
+                    // saves until the resync below lands. Read the fresh
+                    // value (not the render closure) so a rapid double-click
+                    // cannot reuse a stale cfg.
+                    const st = useAppStore.getState();
+                    st.actions.setTrayBusy(true);
+                    try {
+                      const next = !useAppStore.getState().config.TRAY_ENABLED;
+                      await api.setTrayEnabled(next);
+                      const raw = await api.configLoad();
+                      useAppStore.getState().actions.setConfigLocal(
+                        normalizeConfig(typeof raw === "string" ? JSON.parse(raw) : raw)
+                      );
+                    } finally {
+                      useAppStore.getState().actions.setTrayBusy(false);
+                    }
+                  })
+                }
+                className={`relative inline-flex h-6 w-11 shrink-0 rounded-full border transition-colors focus:outline-none focus:ring-2 focus:ring-accent/60 ${
+                  cfg.TRAY_ENABLED
+                    ? "bg-accent/30 border-accent"
+                    : "bg-surface border-card-edge"
+                }`}
+                title={cfg.TRAY_ENABLED ? "Disable system tray" : "Enable system tray"}
+              >
+                <span
+                  className={`absolute top-0.5 h-5 w-5 rounded-full bg-white shadow transition-transform ${
+                    cfg.TRAY_ENABLED ? "translate-x-5" : "translate-x-0.5"
+                  }`}
+                />
+              </button>
+              <span className={`text-xs font-mono ${cfg.TRAY_ENABLED ? "text-success" : "text-muted"}`}>
+                {cfg.TRAY_ENABLED ? "enabled" : "disabled"}
+              </span>
+            </div>
           </Field>
           <div className="grid grid-cols-2 gap-4">
             <Field label="Handshake timeout (s)" hint="Seconds to wait for the DPI handshake signal. 0.5–10.">

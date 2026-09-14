@@ -106,6 +106,13 @@ export function IsAdmin(): $CancellablePromise<boolean> {
 }
 
 /**
+ * FIX(titlebar): maximise-state probe for the React TitleBar icon.
+ */
+export function IsMaximised(): $CancellablePromise<boolean> {
+    return $Call.ByID(439609928);
+}
+
+/**
  * FIX(A3): backend liveness probe for the UI resync tick.
  */
 export function IsRunning(): $CancellablePromise<boolean> {
@@ -125,12 +132,108 @@ export function SelfTest(configPath: string): $CancellablePromise<string> {
 }
 
 /**
+ * FIX(tray-rewrite): SetTrayEnabled — single writer for TRAY_ENABLED.
+ * Serialized under s.mu against ConfigSave/Start/Stop; persists via Rust
+ * then applies via TrayManager.Ensure. Strips the inert "ok" key from the
+ * load payload before re-saving so it never pollutes config.json.
+ */
+export function SetTrayEnabled(enabled: boolean): $CancellablePromise<void> {
+    return $Call.ByID(2988867814, enabled);
+}
+
+/**
  * StartEngine is callable from the frontend as StartEngine(configJSON).
  */
 export function StartEngine(configJSON: string): $CancellablePromise<string> {
     return $Call.ByID(1832008731, configJSON);
 }
 
+/**
+ * FIX #9: tray-initiated engine start using the saved config.
+ */
+export function StartFromTray(): $CancellablePromise<void> {
+    return $Call.ByID(874873277);
+}
+
 export function StopEngine(): $CancellablePromise<string> {
     return $Call.ByID(2951693865);
+}
+
+/**
+ * FIX #9: tray-initiated engine stop.
+ */
+export function StopFromTray(): $CancellablePromise<void> {
+    return $Call.ByID(2242411847);
+}
+
+/**
+ * FIX(tray-rewrite): split runtime vs persisted probes so the frontend
+ * can reconcile without flicker. TrayIsEnabled (legacy name) returns the
+ * runtime state; TrayPersistedEnabled returns the on-disk value.
+ */
+export function TrayIsEnabled(): $CancellablePromise<boolean> {
+    return $Call.ByID(2235902908);
+}
+
+/**
+ * TrayPersistedEnabled reads the on-disk TRAY_ENABLED value (tolerant
+ * coercion, defaults true). Used by Reload/Reset to re-apply only when
+ * disk and runtime disagree.
+ */
+export function TrayPersistedEnabled(): $CancellablePromise<boolean> {
+    return $Call.ByID(3483782881);
+}
+
+/**
+ * TrayRuntimeActive is the explicit runtime probe (tray exists right now).
+ */
+export function TrayRuntimeActive(): $CancellablePromise<boolean> {
+    return $Call.ByID(1904414495);
+}
+
+/**
+ * FIX(titlebar): window controls with explicit error returns so
+ * the frontend cannot silently swallow failures.
+ * FIX(config-persist): the frontend flushes config on
+ * beforeunload / visibilitychange before this runs.
+ * FIX(quit): the close-vs-quit decision is made in main.go's
+ * WindowClosing hook using the package-level `quitting` flag.
+ * This wrapper stays a thin forwarder.
+ */
+export function WindowClose(): $CancellablePromise<void> {
+    return $Call.ByID(3990933141);
+}
+
+/**
+ * FIX(#1): canonical maximise-state probe for the manual-drag TitleBar.
+ */
+export function WindowIsMaximised(): $CancellablePromise<boolean> {
+    return $Call.ByID(802863560);
+}
+
+/**
+ * FIX(titlebar): window controls with explicit error returns so
+ * the frontend cannot silently swallow failures.
+ */
+export function WindowMinimise(): $CancellablePromise<void> {
+    return $Call.ByID(786743050);
+}
+
+/**
+ * FIX(#1): manual window drag for the frameless title bar. The Window
+ * interface exposes no exported drag method in beta.20 (startDrag is
+ * unexported), so this routes through the exported HandleMessage path
+ * ("wails:drag"), which the WebviewWindow handles natively.
+ * TODO(#1): if a future Wails beta exports a drag method, prefer it here.
+ */
+export function WindowStartDrag(): $CancellablePromise<void> {
+    return $Call.ByID(2241193379);
+}
+
+/**
+ * FIX(titlebar): window controls with explicit error returns so
+ * the frontend cannot silently swallow failures.
+ */
+export function WindowToggleMaximise(): $CancellablePromise<void> {
+    return $Call.ByID(2103993100);
 }

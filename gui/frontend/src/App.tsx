@@ -1,5 +1,9 @@
 import { useEffect, useRef } from "react";
 import { useAppStore } from "./stores/appStore";
+// FIX(config-persist): flush-on-hide needs the save binding.
+import * as api from "./api";
+// FIX(titlebar): custom title bar replaces the native one.
+import TitleBar from "./components/TitleBar";
 import Header from "./components/Header";
 import Sidebar from "./components/Sidebar";
 import Console from "./components/Console";
@@ -123,11 +127,42 @@ export default function App() {
 
   useShortcuts();
 
+  // FIX(config-persist): save the current config on every hide/
+  // unload so no edit is lost when the window closes or is hidden
+  // to the tray within the debounce window.
+  useEffect(() => {
+    const flush = () => {
+      const st = useAppStore.getState();
+      // FIX(tray-rewrite): never flush while the tray toggle owns the
+      // disk write — visibilitychange fires on hide-to-tray itself and
+      // would otherwise clobber the Go-owned TRAY_ENABLED value.
+      if (st.trayBusy) return;
+      const cfg = st.config;
+      if (!cfg) return;
+      // fire-and-forget; errors go to console only
+      api.configSave(JSON.stringify(cfg)).catch((e) =>
+        console.error("[flush] config save failed:", e)
+      );
+    };
+    window.addEventListener("beforeunload", flush);
+    const onVis = () => { if (document.visibilityState === "hidden") flush(); };
+    document.addEventListener("visibilitychange", onVis);
+    return () => {
+      window.removeEventListener("beforeunload", flush);
+      document.removeEventListener("visibilitychange", onVis);
+    };
+  }, []);
+
   useEffect(() => {
     if (mounted.current) return;
     mounted.current = true;
     const st = useAppStore.getState();
-    st.actions.load();
+    // FIX(tray-persist): startup evidence — log the on-disk tray value once
+    // load() settles, so toggle-persistence bugs are diagnosable.
+    st.actions.load().finally(() => {
+      console.log("[startup] TRAY_ENABLED on disk =",
+        useAppStore.getState().config.TRAY_ENABLED);
+    });
     let ticks = 0;
     const interval = setInterval(() => {
       const s = useAppStore.getState();
@@ -149,6 +184,8 @@ export default function App() {
 
   return (
     <div className="flex flex-col h-full bg-bg">
+      {/* FIX(titlebar): custom title bar replaces the native one. */}
+      <TitleBar />
       <Header />
       <div className="flex flex-1 min-h-0">
         <Sidebar />

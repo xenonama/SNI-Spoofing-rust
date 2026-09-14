@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"encoding/json"
+	// FIX(titlebar): fmt for explicit window-lookup errors.
+	"fmt"
 	"sync"
 
 	"github.com/wailsapp/wails/v3/pkg/application"
@@ -35,6 +37,12 @@ func (s *EngineService) ServiceShutdown() error {
 	// WinDivert handles are released — no zombie process, DLL unlocked.
 	rustCancelProbe()
 	_, _ = rustStopEngine()
+	// FIX(tray-rewrite): remove the icon and cancel the quit safety net
+	// on clean shutdown so Exit never hard-kills mid-save.
+	cancelQuitSafetyNet()
+	if m := getTrayManager(); m != nil {
+		m.Shutdown()
+	}
 	return nil
 }
 
@@ -49,6 +57,26 @@ func (s *EngineService) StopEngine() (string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return rustStopEngine()
+}
+
+// FIX #9: tray-initiated engine start using the saved config.
+func (s *EngineService) StartFromTray() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cfg, err := rustLoadConfig()
+	if err != nil {
+		return err
+	}
+	_, err = rustStartEngine(cfg)
+	return err
+}
+
+// FIX #9: tray-initiated engine stop.
+func (s *EngineService) StopFromTray() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, err := rustStopEngine()
+	return err
 }
 
 func (s *EngineService) GetStats() (string, error) {
@@ -170,4 +198,205 @@ func selfTestOk(report string) bool {
 		return false
 	}
 	return v.Ok
+}
+
+// FIX(tray-rewrite): stored main window handle. Set once from main.go
+// after window creation; currentWindow() prefers it so Hide() can never
+// break tray click-to-restore or title-bar controls.
+var (
+	mainWindowMu sync.RWMutex
+	mainWindow   application.Window
+)
+
+// SetMainWindow stores the main window handle (called once from main).
+func SetMainWindow(w application.Window) {
+	mainWindowMu.Lock()
+	defer mainWindowMu.Unlock()
+	mainWindow = w
+}
+
+// FIX(titlebar): window controls with explicit error returns so
+// the frontend cannot silently swallow failures.
+func (s *EngineService) WindowMinimise() error {
+	w := currentWindow()
+	if w == nil {
+		return fmt.Errorf("no window available")
+	}
+	w.Minimise()
+	return nil
+}
+
+// FIX(titlebar): window controls with explicit error returns so
+// the frontend cannot silently swallow failures.
+func (s *EngineService) WindowToggleMaximise() error {
+	w := currentWindow()
+	if w == nil {
+		return fmt.Errorf("no window available")
+	}
+	w.ToggleMaximise()
+	return nil
+}
+
+// FIX(titlebar): window controls with explicit error returns so
+// the frontend cannot silently swallow failures.
+// FIX(config-persist): the frontend flushes config on
+// beforeunload / visibilitychange before this runs.
+// FIX(quit): the close-vs-quit decision is made in main.go's
+// WindowClosing hook using the package-level `quitting` flag.
+// This wrapper stays a thin forwarder.
+func (s *EngineService) WindowClose() error {
+	w := currentWindow()
+	if w == nil {
+		return fmt.Errorf("no window available")
+	}
+	w.Close()
+	return nil
+}
+
+// FIX(titlebar): maximise-state probe for the React TitleBar icon.
+func (s *EngineService) IsMaximised() bool {
+	if w := currentWindow(); w != nil {
+		return w.IsMaximised()
+	}
+	return false
+}
+
+// FIX(#1): canonical maximise-state probe for the manual-drag TitleBar.
+func (s *EngineService) WindowIsMaximised() bool {
+	if w := currentWindow(); w != nil {
+		return w.IsMaximised()
+	}
+	return false
+}
+
+// FIX(#1): manual window drag for the frameless title bar. The Window
+// interface exposes no exported drag method in beta.20 (startDrag is
+// unexported), so this routes through the exported HandleMessage path
+// ("wails:drag"), which the WebviewWindow handles natively.
+// TODO(#1): if a future Wails beta exports a drag method, prefer it here.
+func (s *EngineService) WindowStartDrag() error {
+	w := currentWindow()
+	if w == nil {
+		return fmt.Errorf("no window available")
+	}
+	w.HandleMessage("wails:drag")
+	return nil
+}
+
+// FIX(tray-rewrite): single manager reference. Wired once from main.go.
+// All tray mutations go through TrayManager.Ensure (serialized,
+// generation-guarded); there are no create/destroy callback pairs and
+// no split locks anymore.
+var (
+	trayManagerMu sync.RWMutex
+	trayManager   *TrayManager
+)
+
+// SetTrayManager wires the global manager (called once from main).
+func SetTrayManager(m *TrayManager) {
+	trayManagerMu.Lock()
+	defer trayManagerMu.Unlock()
+	trayManager = m
+}
+
+func getTrayManager() *TrayManager {
+	trayManagerMu.RLock()
+	defer trayManagerMu.RUnlock()
+	return trayManager
+}
+
+// applyTrayState enables or disables the tray at runtime via the manager.
+func applyTrayState(enabled bool) error {
+	m := getTrayManager()
+	if m == nil {
+		return fmt.Errorf("tray manager not ready")
+	}
+	return m.Ensure(enabled)
+}
+
+// FIX(tray-rewrite): SetTrayEnabled — single writer for TRAY_ENABLED.
+// Serialized under s.mu against ConfigSave/Start/Stop; persists via Rust
+// then applies via TrayManager.Ensure. Strips the inert "ok" key from the
+// load payload before re-saving so it never pollutes config.json.
+func (s *EngineService) SetTrayEnabled(enabled bool) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	trayLogInfo(fmt.Sprintf("SetTrayEnabled: start (target=%v)", enabled))
+	raw, err := rustLoadConfig()
+	if err != nil {
+		trayLogInfo("SetTrayEnabled: disk config unreadable, seeding from defaults: " + err.Error())
+		raw, err = rustGetDefaultConfig()
+		if err != nil {
+			return fmt.Errorf("load config: %w", err)
+		}
+	}
+	var cfg map[string]any
+	if err := json.Unmarshal([]byte(raw), &cfg); err != nil {
+		return fmt.Errorf("parse config: %w", err)
+	}
+	delete(cfg, "ok")
+	cfg["TRAY_ENABLED"] = enabled
+	// keep the legacy lowercase key in sync too
+	cfg["tray_enabled"] = enabled
+
+	out, err := json.Marshal(cfg)
+	if err != nil {
+		return fmt.Errorf("marshal config: %w", err)
+	}
+	if _, err := rustSaveConfig(string(out)); err != nil {
+		return fmt.Errorf("save config: %w", err)
+	}
+	trayLogInfo("SetTrayEnabled: config persisted")
+	if err := applyTrayState(enabled); err != nil {
+		return fmt.Errorf("apply tray state: %w", err)
+	}
+	trayLogInfo(fmt.Sprintf("SetTrayEnabled: applied (enabled=%v)", enabled))
+	return nil
+}
+
+// FIX(tray-rewrite): split runtime vs persisted probes so the frontend
+// can reconcile without flicker. TrayIsEnabled (legacy name) returns the
+// runtime state; TrayPersistedEnabled returns the on-disk value.
+func (s *EngineService) TrayIsEnabled() bool {
+	return trayRuntimeEnabled()
+}
+
+// TrayRuntimeActive is the explicit runtime probe (tray exists right now).
+func (s *EngineService) TrayRuntimeActive() bool {
+	return trayRuntimeEnabled()
+}
+
+// TrayPersistedEnabled reads the on-disk TRAY_ENABLED value (tolerant
+// coercion, defaults true). Used by Reload/Reset to re-apply only when
+// disk and runtime disagree.
+func (s *EngineService) TrayPersistedEnabled() bool {
+	return readTrayEnabled()
+}
+
+// currentWindow prefers the stored main window handle (stable across
+// Hide); falls back to beta.20 native accessors only if unset.
+func currentWindow() application.Window {
+	mainWindowMu.RLock()
+	w := mainWindow
+	mainWindowMu.RUnlock()
+	if w != nil {
+		return w
+	}
+	if m := getTrayManager(); m != nil {
+		if ww := m.window(); ww != nil {
+			return ww
+		}
+	}
+	app := application.Get()
+	if app == nil {
+		return nil
+	}
+	if cw := app.Window.Current(); cw != nil {
+		return cw
+	}
+	if ww, ok := app.Window.Get(""); ok {
+		return ww
+	}
+	return nil
 }

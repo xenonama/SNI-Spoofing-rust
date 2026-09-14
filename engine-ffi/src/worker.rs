@@ -15,7 +15,7 @@
 use sni_core::{
     config::{Config, Endpoint},
     fake_tcp::BypassMethod,
-    picker::{build_quic_filter, build_tcp_filter, ep_key, pick_sni, EndpointPicker},
+    picker::{build_ipv6_drop_filter, build_quic_filter, build_tcp_filter, ep_key, pick_sni, EndpointPicker},
     stats::Stats,
 };
 use parking_lot::Mutex as ParkMutex;
@@ -264,11 +264,23 @@ impl Worker {
     }
 
     pub fn tcp_filter(&self) -> String {
-        build_tcp_filter(&self.interface_ipv4, &self.config.endpoints)
+        // FIX #8: pass ip_mode so "ipv6" mode returns the IPv6 drop filter.
+        build_tcp_filter(
+            &self.interface_ipv4,
+            &self.config.endpoints,
+            &self.config.ip_mode,
+        )
     }
 
     pub fn quic_filter(&self) -> String {
         build_quic_filter(&self.interface_ipv4)
+    }
+
+    /// FIX #8: IPv6 drop filter. Only used when ip_mode is "ipv4" or
+    /// "both" — forces the browser to fall back to IPv4 so the fake
+    /// burst keeps working.
+    pub fn ipv6_drop_filter(&self) -> String {
+        build_ipv6_drop_filter(&self.config.endpoints)
     }
 
     // FIX(perf): sync fast-path check for the DPI dispatch guard. Uses the

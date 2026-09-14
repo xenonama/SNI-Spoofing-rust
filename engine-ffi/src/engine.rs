@@ -46,6 +46,10 @@ pub struct EngineHandle {
     worker: Arc<Worker>,
     tcp: WindivertHandle,
     quic: Option<WindivertHandle>,
+    // FIX #8: IPv6 drop handle (only when ip_mode is "ipv4" or
+    // "both"). Drops all IPv6 TCP to the endpoints so the browser
+    // falls back to IPv4.
+    ipv6: Option<WindivertHandle>,
     threads: Vec<std::thread::JoinHandle<()>>,
     alive: Arc<AtomicBool>,
     runtime_thread: Option<std::thread::JoinHandle<()>>,
@@ -81,6 +85,28 @@ impl EngineHandle {
                         "WinDivert QUIC open failed (quic_mode={}): {}. Run as Administrator, keep WinDivert.dll + WinDivert64.sys next to the exe.",
                         quic_mode, e
                     ));
+                }
+            }
+        } else {
+            None
+        };
+
+        // FIX #8: open the IPv6 drop handle when the user wants IPv4-only
+        // bypass (or "both"). Failures are non-fatal — log and continue.
+        let ip_mode = wcfg.ip_mode.clone();
+        let need_ipv6_drop = ip_mode == "ipv4" || ip_mode == "both";
+        let ipv6: Option<WindivertHandle> = if need_ipv6_drop {
+            match WindivertHandle::open(worker.ipv6_drop_filter()) {
+                Ok(h) => {
+                    tracing::info!("IPv6 drop handle opened (mode={})", ip_mode);
+                    Some(h)
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "IPv6 drop handle failed to open ({}). Continuing with IPv4 only.",
+                        e
+                    );
+                    None
                 }
             }
         } else {
@@ -171,6 +197,24 @@ impl EngineHandle {
             );
         }
 
+        // ---- IPv6 drop thread (ipv4 / both modes) ----
+        // FIX #8: drop IPv6 silently. Not reinjecting means WinDivert
+        // swallows the packet, forcing the browser to retry on IPv4.
+        if let Some(ih) = ipv6.clone() {
+            threads.push(
+                std::thread::Builder::new()
+                    .name("windivert-ipv6".into())
+                    .spawn(move || {
+                        ih.run(|_pkt| {
+                            // FIX #8: drop IPv6 silently. Not reinjecting
+                            // means WinDivert swallows the packet, forcing
+                            // the browser to retry on IPv4.
+                        });
+                    })
+                    .map_err(|e| format!("cannot spawn IPv6 thread: {}", e))?,
+            );
+        }
+
         // ---- Tokio thread: reaper + accept loop ----
         let w2 = Arc::clone(&worker);
         let runtime_thread = std::thread::Builder::new()
@@ -194,6 +238,8 @@ impl EngineHandle {
             worker,
             tcp,
             quic,
+            // FIX #8: IPv6 drop handle.
+            ipv6,
             threads,
             alive,
             runtime_thread: Some(runtime_thread),
@@ -220,6 +266,10 @@ impl EngineHandle {
         self.tcp.stop();
         if let Some(q) = self.quic.take() {
             q.stop();
+        }
+        // FIX #8: stop the IPv6 drop handle.
+        if let Some(h) = self.ipv6.take() {
+            h.stop();
         }
         self.worker.request_shutdown();
         // Reset traffic + scoreboard so stale values never flash on next Start.

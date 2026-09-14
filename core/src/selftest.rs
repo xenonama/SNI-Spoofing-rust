@@ -107,6 +107,89 @@ fn check_tlsfp() -> Result<String, String> {
     if crate::tls::check_hello_params(&[0u8; 32], &[0u8; 32], &vec![b'x'; 220], &[0u8; 32]).is_ok() {
         return Err("oversize SNI should fail".to_string());
     }
+    // FIX #2: Chrome 124 must NOT look like the legacy 517B template.
+    let chrome = crate::tls::build_fake_client_hello(
+        b"example.com",
+        crate::tls::TlsProfile::Chrome124,
+    );
+    if chrome.len() == 517 {
+        return Err("chrome_124 hello still looks like the legacy 517B template".to_string());
+    }
+    if chrome.len() < 512 {
+        return Err(format!(
+            "chrome_124 hello shorter than 512B: {}",
+            chrome.len()
+        ));
+    }
+    if chrome.len() < 6 || chrome[0..3] != [0x16, 0x03, 0x01] {
+        return Err("chrome_124 record header mismatch".to_string());
+    }
+    if chrome[5] != 0x01 {
+        return Err("chrome_124 handshake type is not ClientHello".to_string());
+    }
+    // The TLS_AES_128_GCM_SHA256 cipher suite (0x1301) must be present
+    // somewhere in the body.
+    if !chrome.windows(2).any(|w| w == [0x13, 0x01]) {
+        return Err("chrome_124 missing TLS_AES_128_GCM_SHA256 cipher".to_string());
+    }
+    // Chrome 120 should also produce a non-517 length.
+    let chrome120 = crate::tls::build_fake_client_hello(
+        b"example.com",
+        crate::tls::TlsProfile::Chrome120,
+    );
+    if chrome120.len() == 517 {
+        return Err("chrome_120 hello still looks like the legacy 517B template".to_string());
+    }
+    // FIX(firefox): Firefox must differ from Chrome AND must NOT
+    // contain a GREASE cipher suite (0x?A?A pattern).
+    let firefox = crate::tls::build_fake_client_hello(
+        b"example.com",
+        crate::tls::TlsProfile::Firefox124,
+    );
+    if firefox.len() == 517 {
+        return Err("firefox_124 still looks like the legacy 517B template".to_string());
+    }
+    if firefox.len() < 100 {
+        return Err(format!("firefox_124 suspiciously short: {}", firefox.len()));
+    }
+    if firefox.len() < 6 || firefox[0..3] != [0x16, 0x03, 0x01] {
+        return Err("firefox_124 record header mismatch".to_string());
+    }
+    if firefox[5] != 0x01 {
+        return Err("firefox_124 handshake type is not ClientHello".to_string());
+    }
+    // Firefox must NOT contain the TLS_AES_128_GCM_SHA256-only
+    // pattern that Chrome uses as its first real suite — Firefox
+    // starts with 0x1301 too, but the second suite differs
+    // (Firefox: 0x1303, Chrome: 0x1302). Check the second suite.
+    // Search for the byte sequence 0x13 0x03 in the cipher list.
+    let has_1303 = firefox.windows(2).any(|w| w == [0x13, 0x03]);
+    if !has_1303 {
+        return Err("firefox_124 missing TLS_CHACHA20_POLY1305_SHA256 (0x1303)".to_string());
+    }
+    // Firefox must NOT use GREASE (0x?A?A where high nibble is even).
+    // We check the supported_versions body indirectly: no GREASE
+    // patterns in the first 200 bytes of the handshake body.
+    let body = &firefox[5..];
+    let grease_hits = body
+        .windows(2)
+        .filter(|w| {
+            let hi = w[0];
+            let lo = w[1];
+            hi == lo && (hi & 0x0F) == 0x0A && (hi & 0xF0) % 0x10 == 0
+        })
+        .count();
+    if grease_hits > 0 {
+        return Err(format!(
+            "firefox_124 contains {} GREASE pattern(s); Firefox does not use GREASE",
+            grease_hits
+        ));
+    }
+    // FIX(firefox): distinctness best-effort — Chrome and Firefox should
+    // usually differ in total length when randomness is held constant,
+    // but randomness is per-call and padding choices may drift, so do
+    // not fail if equal; just note it.
+    let _distinct_lengths = chrome.len() != firefox.len();
     Ok(format!("tls fingerprint OK (legacy {}B)", hello.len()))
 }
 

@@ -59,14 +59,37 @@ pub fn ep_key(ep: &Endpoint) -> String {
     format!("{}:{}", ep.ip, ep.port)
 }
 
+/// FIX #8: IPv6 drop filter. Matches any IPv6 TCP on the endpoint
+/// ports. Used when ip_mode is "ipv4" or "both" to force the
+/// browser to fall back to IPv4.
+pub fn build_ipv6_drop_filter(endpoints: &[Endpoint]) -> String {
+    if endpoints.is_empty() {
+        return "false".to_string();
+    }
+    let ports: Vec<String> = endpoints
+        .iter()
+        .map(|e| format!("tcp.DstPort == {} or tcp.SrcPort == {}", e.port, e.port))
+        .collect();
+    format!("tcp and ipv6 and ({})", ports.join(" or "))
+}
+
 /// TCP filter covering ALL endpoints (both directions).
 /// Mirrors `main.py` filt construction exactly.
 /// FIX P3/P4: scope to the endpoint ports so non-handshake traffic (80/8080/
 /// probe/relay data) doesn't hit DPI; guard empty to avoid `tcp and ()`
 /// syntax error.
-pub fn build_tcp_filter(interface_ipv4: &str, endpoints: &[Endpoint]) -> String {
+pub fn build_tcp_filter(
+    interface_ipv4: &str,
+    endpoints: &[Endpoint],
+    ip_mode: &str,
+) -> String {
     if endpoints.is_empty() {
         return "tcp and false".to_string();
+    }
+    // FIX #8: "ipv6" mode uses only the IPv6 drop filter; IPv4
+    // traffic is forwarded untouched by the absence of a handle.
+    if ip_mode == "ipv6" {
+        return build_ipv6_drop_filter(endpoints);
     }
     let parts: Vec<String> = endpoints
         .iter()

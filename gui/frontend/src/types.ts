@@ -16,6 +16,10 @@ export interface AppConfig {
   TLS_FINGERPRINT: string;
   PADDING_SIZE: number;
   QUIC_MODE: string;
+  // FIX #8: address family selection.
+  IP_MODE: string;
+  // FIX(#3): tray on/off toggle (takes effect on next launch).
+  TRAY_ENABLED: boolean;
   MODE: string;
   PROBE_TRIES: number;
   PROBE_TIMEOUT: number;
@@ -101,6 +105,9 @@ export const FINGERPRINTS = [
 
 export const QUIC_MODES = ["block", "spoof", "passthrough"] as const;
 
+// FIX #8: address family selection modes.
+export const IP_MODES = ["ipv4", "ipv6", "both"] as const;
+
 export const PROXY_MODES = ["SNI Only", "Trojan + Xray"] as const;
 
 export function defaultConfig(): AppConfig {
@@ -118,11 +125,27 @@ export function defaultConfig(): AppConfig {
     TLS_FINGERPRINT: "legacy",
     PADDING_SIZE: 0,
     QUIC_MODE: "block",
+    // FIX #8: default to IPv4 bypass + IPv6 drop.
+    IP_MODE: "ipv4",
+    // FIX(#3): tray on by default.
+    TRAY_ENABLED: true,
     MODE: "SNI Only",
     PROBE_TRIES: 2,
     PROBE_TIMEOUT: 3.0,
     // FIX(#1c): dead SOCKS5/HTTP defaults removed (see AppConfig).
   };
+}
+
+/** FIX(tray-rewrite): tolerant bool coercion for TRAY_ENABLED. */
+export function coerceTrayBool(v: unknown, fallback: boolean): boolean {
+  if (typeof v === "boolean") return v;
+  if (typeof v === "number") return v !== 0;
+  if (typeof v === "string") {
+    const s = v.trim().toLowerCase();
+    if (["true", "1", "yes", "y", "on"].includes(s)) return true;
+    if (["false", "0", "no", "n", "off", ""].includes(s)) return false;
+  }
+  return fallback;
 }
 
 /** Normalize a Rust config payload (ok-wrapped or bare) into AppConfig. */
@@ -144,6 +167,10 @@ export function normalizeConfig(raw: any): AppConfig {
     TLS_FINGERPRINT: String(get("TLS_FINGERPRINT", "tls_fingerprint", base.TLS_FINGERPRINT)),
     PADDING_SIZE: Number(get("PADDING_SIZE", "padding_size", base.PADDING_SIZE)),
     QUIC_MODE: String(get("QUIC_MODE", "quic_mode", base.QUIC_MODE)),
+    // FIX #8: address family selection.
+    IP_MODE: String(get("IP_MODE", "ip_mode", base.IP_MODE)),
+    // FIX(tray-rewrite): coerced tray toggle (bool/string/number).
+    TRAY_ENABLED: coerceTrayBool(raw.TRAY_ENABLED ?? raw.tray_enabled, base.TRAY_ENABLED),
     MODE: String(get("MODE", "mode", base.MODE)),
     PROBE_TRIES: Number(get("PROBE_TRIES", "probe_tries", base.PROBE_TRIES)),
     PROBE_TIMEOUT: Number(get("PROBE_TIMEOUT", "probe_timeout", base.PROBE_TIMEOUT)),

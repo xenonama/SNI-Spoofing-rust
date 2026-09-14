@@ -34,6 +34,10 @@ interface AppState {
   page: number;
   config: AppConfig;
   admin: boolean | null;
+  // FIX(tray-rewrite): true while the tray toggle owns the disk write.
+  // setConfig autosave and App flush skip their save while set so they
+  // can never clobber the Go-owned TRAY_ENABLED write.
+  trayBusy: boolean;
   // FIX(B1): engine-start wall clock (null = stopped). Header derives the
   // uptime display from this; the backend snapshot uptime (process start)
   // is deliberately NOT used.
@@ -52,6 +56,12 @@ interface AppState {
   actions: {
     setPage: (p: number) => void;
     setConfig: (c: AppConfig) => void;
+    // FIX(tray-persist): store-only update without saving. The tray toggle
+    // uses this after the Go side owns the disk write, so no second
+    // autosave writer races rustSaveConfig.
+    setConfigLocal: (c: AppConfig) => void;
+    // FIX(tray-rewrite): tray write-ownership guard.
+    setTrayBusy: (b: boolean) => void;
     notify: (msg: string | null) => void;
     setEpSort: (key: TableSortKey) => void;
     setEpFilter: (f: string) => void;
@@ -120,6 +130,10 @@ async function unwrapCall(p: Promise<unknown>): Promise<any> {
 // nothing changed so idle ticks cause no re-render (no coil whine, <3% CPU).
 let lastStatsSig = "";
 let lastLogSig = "";
+// FIX(persist): no debounce timer — every setConfig persists
+// immediately (the Rust side does an atomic tmp+rename write).
+// (Removed the FIX(#4) autoSaveTimer: debouncing let an immediate
+// exit cancel the pending save.)
 // FIX(B7): last tick wall-clock for the measured poll-rate EMA.
 let lastTickAt = 0;
 
@@ -145,6 +159,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   page: 0,
   config: defaultConfig(),
   admin: null,
+  trayBusy: false,
   engineStartedAt: null,
   pollHz: 0,
   notice: null,
@@ -155,7 +170,27 @@ export const useAppStore = create<AppState>((set, get) => ({
   sniFilter: "",
   actions: {
     setPage: (p) => set({ page: p }),
-    setConfig: (c) => set({ config: c }),
+    setConfig: (c) => {
+      set({ config: c });
+      // FIX(tray-rewrite): skip autosave while the tray toggle owns the
+      // disk write; the toggle resyncs the store afterwards with the
+      // authoritative value, so no edit is lost.
+      if (get().trayBusy) return;
+      // FIX(persist): immediate persistence on every change.
+      // The Rust side does an atomic tmp+rename write; this is
+      // fast enough that debouncing is unnecessary complexity.
+      api.configSave(JSON.stringify(c)).catch((e) =>
+        console.error("[autosave] config save failed:", e)
+      );
+    },
+    setTrayBusy: (b) => {
+      set({ trayBusy: b });
+    },
+    // FIX(tray-persist): store-only update, no disk write. Used by the tray
+    // toggle to resync from disk after Go owns the save (see BypassPage).
+    setConfigLocal: (c) => {
+      set({ config: c });
+    },
     // IMPROVE(U3): click cycles asc → desc → none (unsorted).
     setEpSort: (key) =>
       set((s) => ({
