@@ -34,6 +34,10 @@ interface AppState {
   page: number;
   config: AppConfig;
   admin: boolean | null;
+  // FIX(config-race): false until the initial load() settles. The UI is
+  // gated on this and setConfig refuses edits while false, so a startup
+  // load() can never overwrite a user edit made before it completed.
+  loaded: boolean;
   // FIX(tray-rewrite): true while the tray toggle owns the disk write.
   // setConfig autosave and App flush skip their save while set so they
   // can never clobber the Go-owned TRAY_ENABLED write.
@@ -159,6 +163,8 @@ export const useAppStore = create<AppState>((set, get) => ({
   page: 0,
   config: defaultConfig(),
   admin: null,
+  // FIX(config-race): edits stay locked until load() finishes (see load).
+  loaded: false,
   trayBusy: false,
   engineStartedAt: null,
   pollHz: 0,
@@ -171,6 +177,12 @@ export const useAppStore = create<AppState>((set, get) => ({
   actions: {
     setPage: (p) => set({ page: p }),
     setConfig: (c) => {
+      // FIX(config-race): no edits before load() finishes, or the
+      // load will overwrite them.
+      if (!get().loaded) {
+        console.warn("[setConfig] ignored: config not loaded yet");
+        return;
+      }
       set({ config: c });
       // FIX(tray-rewrite): skip autosave while the tray toggle owns the
       // disk write; the toggle resyncs the store afterwards with the
@@ -276,6 +288,9 @@ export const useAppStore = create<AppState>((set, get) => ({
       } catch {
         set({ admin: null });
       }
+      // FIX(config-race): unlock edits only after the initial
+      // config has been loaded into the store.
+      set({ loaded: true });
     },
     refreshStats: async () => {
       try {

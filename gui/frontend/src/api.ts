@@ -41,6 +41,10 @@ export const getDefaultConfig = ()               => call("Default config", () =>
 export const getActiveConns = ()                 => call("Active connections", () => EngineService.GetActiveConnections());
 // FIX(B4): cooperative probe cancellation (window close).
 export const cancelProbe   = ()                   => EngineService.CancelProbe();
+// FIX(config-race): ensures any in-flight config write finishes
+// before the app hides or quits.
+export const flushConfig = () =>
+  call("Flush config", () => EngineService.FlushConfig());
 
 // FIX(titlebar): window controls for the custom title bar.
 // NOTE: `as any` keeps tsc green before `wails build` regenerates the

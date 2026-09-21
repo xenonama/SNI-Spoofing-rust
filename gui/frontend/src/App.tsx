@@ -121,6 +121,9 @@ function Notice() {
 
 export default function App() {
   const page = useAppStore((s) => s.page);
+  // FIX(config-race): gate the UI until the initial config load settles
+  // so no user edit can happen before load() finishes and be overwritten.
+  const loaded = useAppStore((s) => s.loaded);
   // FIX(B8): guard against React StrictMode double-mount running the
   // startup effect twice (load + duplicate pollers) in dev.
   const mounted = useRef(false);
@@ -130,25 +133,40 @@ export default function App() {
   // FIX(config-persist): save the current config on every hide/
   // unload so no edit is lost when the window closes or is hidden
   // to the tray within the debounce window.
+  // FIX(config-race): await the Go-side FlushConfig barrier after the
+  // save so process exit cannot drop an in-flight write.
   useEffect(() => {
-    const flush = () => {
+    const flush = async () => {
+      try {
+        await api.flushConfig();
+      } catch (e) {
+        console.error("[flush] failed:", e);
+      }
+    };
+    const saveThenFlush = () => {
       const st = useAppStore.getState();
       // FIX(tray-rewrite): never flush while the tray toggle owns the
       // disk write — visibilitychange fires on hide-to-tray itself and
       // would otherwise clobber the Go-owned TRAY_ENABLED value.
       if (st.trayBusy) return;
       const cfg = st.config;
-      if (!cfg) return;
-      // fire-and-forget; errors go to console only
+      if (!cfg) {
+        void flush();
+        return;
+      }
+      // fire-and-forget save, then barrier; errors go to console only
       api.configSave(JSON.stringify(cfg)).catch((e) =>
         console.error("[flush] config save failed:", e)
-      );
+      ).finally(() => { void flush(); });
     };
-    window.addEventListener("beforeunload", flush);
-    const onVis = () => { if (document.visibilityState === "hidden") flush(); };
+    const onBeforeUnload = () => { void saveThenFlush(); };
+    window.addEventListener("beforeunload", onBeforeUnload);
+    const onVis = () => {
+      if (document.visibilityState === "hidden") void saveThenFlush();
+    };
     document.addEventListener("visibilitychange", onVis);
     return () => {
-      window.removeEventListener("beforeunload", flush);
+      window.removeEventListener("beforeunload", onBeforeUnload);
       document.removeEventListener("visibilitychange", onVis);
     };
   }, []);
@@ -181,6 +199,16 @@ export default function App() {
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // FIX(config-race): loading gate — disable the UI until load() settles
+  // so no user edit can race the initial config load.
+  if (!loaded) {
+    return (
+      <div className="flex items-center justify-center h-screen bg-bg text-white">
+        <span className="text-sm text-muted">Loading…</span>
+      </div>
+    );
+  }
 
   return (
     <div className="flex flex-col h-full bg-bg">

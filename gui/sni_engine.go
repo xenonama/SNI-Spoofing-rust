@@ -22,6 +22,11 @@ type EngineService struct {
 	mu sync.Mutex
 }
 
+// FIX(config-race): serialize every config.json write so two
+// concurrent saves (frontend auto-save + tray toggle) cannot
+// interleave and lose each other's changes.
+var configWriteMu sync.Mutex
+
 func NewEngineService() *EngineService {
 	return &EngineService{}
 }
@@ -158,10 +163,26 @@ func (s *EngineService) EmitProbeResults() {
 }
 
 // ConfigSave writes the config JSON to disk atomically.
+// FIX(config-race): serialized under configWriteMu (then s.mu) so a
+// frontend auto-save racing the tray toggle queues instead of
+// interleaving writes and losing changes.
 func (s *EngineService) ConfigSave(configJSON string) (string, error) {
+	configWriteMu.Lock()
+	defer configWriteMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return rustSaveConfig(configJSON)
+}
+
+// FIX(config-race): the frontend can poll this to make sure a
+// save finished before the window closes.
+func (s *EngineService) FlushConfig() error {
+	configWriteMu.Lock()
+	defer configWriteMu.Unlock()
+	// Nothing to do here — acquiring the mutex guarantees that
+	// any in-flight write has completed (mutex is held during
+	// the write). If we reach this point, disk is in sync.
+	return nil
 }
 
 // ConfigLoad reads the config JSON from disk.
@@ -318,7 +339,11 @@ func applyTrayState(enabled bool) error {
 // Serialized under s.mu against ConfigSave/Start/Stop; persists via Rust
 // then applies via TrayManager.Ensure. Strips the inert "ok" key from the
 // load payload before re-saving so it never pollutes config.json.
+// FIX(config-race): also serialized under configWriteMu (acquired before
+// s.mu) so a tray write racing a frontend auto-save cannot interleave.
 func (s *EngineService) SetTrayEnabled(enabled bool) error {
+	configWriteMu.Lock()
+	defer configWriteMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 

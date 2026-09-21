@@ -40,6 +40,9 @@ export function ConfigPath(): $CancellablePromise<string> {
 
 /**
  * ConfigSave writes the config JSON to disk atomically.
+ * FIX(config-race): serialized under configWriteMu (then s.mu) so a
+ * frontend auto-save racing the tray toggle queues instead of
+ * interleaving writes and losing changes.
  */
 export function ConfigSave(configJSON: string): $CancellablePromise<string> {
     return $Call.ByID(107538784, configJSON);
@@ -69,6 +72,14 @@ export function EmitStats(): $CancellablePromise<void> {
 
 export function ExportLogs(): $CancellablePromise<string> {
     return $Call.ByID(2091104638);
+}
+
+/**
+ * FIX(config-race): the frontend can poll this to make sure a
+ * save finished before the window closes.
+ */
+export function FlushConfig(): $CancellablePromise<void> {
+    return $Call.ByID(2231200897);
 }
 
 /**
@@ -136,6 +147,8 @@ export function SelfTest(configPath: string): $CancellablePromise<string> {
  * Serialized under s.mu against ConfigSave/Start/Stop; persists via Rust
  * then applies via TrayManager.Ensure. Strips the inert "ok" key from the
  * load payload before re-saving so it never pollutes config.json.
+ * FIX(config-race): also serialized under configWriteMu (acquired before
+ * s.mu) so a tray write racing a frontend auto-save cannot interleave.
  */
 export function SetTrayEnabled(enabled: boolean): $CancellablePromise<void> {
     return $Call.ByID(2988867814, enabled);
