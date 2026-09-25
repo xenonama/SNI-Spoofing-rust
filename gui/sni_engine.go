@@ -205,6 +205,17 @@ func (s *EngineService) CancelProbe() {
 	rustCancelProbe()
 }
 
+// FIX(ui): zero the stats counters (Active, Total, OK, Fail,
+// Up, Down, boards) without touching the running engine.
+func (s *EngineService) ResetStats() (string, error) {
+	return rustResetStats()
+}
+
+// FIX(perf): single-call snapshot for the 1Hz poller.
+func (s *EngineService) SnapshotAll(logSince uint32) (string, error) {
+	return rustSnapshotAll(logSince)
+}
+
 // ConfigPath returns the path of config.json.
 func (s *EngineService) ConfigPath() string {
 	return rustConfigPath()
@@ -274,15 +285,8 @@ func (s *EngineService) WindowClose() error {
 	return nil
 }
 
-// FIX(titlebar): maximise-state probe for the React TitleBar icon.
-func (s *EngineService) IsMaximised() bool {
-	if w := currentWindow(); w != nil {
-		return w.IsMaximised()
-	}
-	return false
-}
-
-// FIX(#1): canonical maximise-state probe for the manual-drag TitleBar.
+// FIX(dedup): canonical maximise-state probe. The old IsMaximised
+// wrapper was removed; this is the single source of truth.
 func (s *EngineService) WindowIsMaximised() bool {
 	if w := currentWindow(); w != nil {
 		return w.IsMaximised()
@@ -380,14 +384,9 @@ func (s *EngineService) SetTrayEnabled(enabled bool) error {
 	return nil
 }
 
-// FIX(tray-rewrite): split runtime vs persisted probes so the frontend
-// can reconcile without flicker. TrayIsEnabled (legacy name) returns the
-// runtime state; TrayPersistedEnabled returns the on-disk value.
-func (s *EngineService) TrayIsEnabled() bool {
-	return trayRuntimeEnabled()
-}
-
-// TrayRuntimeActive is the explicit runtime probe (tray exists right now).
+// FIX(dedup): TrayIsEnabled (legacy duplicate of the probe below)
+// was removed; this is the single runtime probe. TrayPersistedEnabled
+// reads the on-disk value instead.
 func (s *EngineService) TrayRuntimeActive() bool {
 	return trayRuntimeEnabled()
 }

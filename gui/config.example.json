@@ -1,0 +1,21 @@
+{
+  "LISTEN_HOST": "127.0.0.1",
+  "LISTEN_PORT": 40443,
+  "ENDPOINTS": [
+    { "ip": "1.1.1.1", "port": 443 }
+  ],
+  "FAKE_SNIS": ["example.com"],
+  "BYPASS_METHOD": "auto",
+  "HANDSHAKE_TIMEOUT": 2.0,
+  "MAX_CONNECTIONS": 200,
+  "FAKE_DELAY": 0.001,
+  "SEQ_OVERLAP": 3,
+  "TLS_FINGERPRINT": "chrome_124",
+  "PADDING_SIZE": 0,
+  "QUIC_MODE": "block",
+  "MODE": "SNI Only",
+  "PROBE_TRIES": 2,
+  "PROBE_TIMEOUT": 3.0,
+  "IP_MODE": "ipv4",
+  "TRAY_ENABLED": true
+}

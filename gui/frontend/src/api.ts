@@ -46,6 +46,13 @@ export const cancelProbe   = ()                   => EngineService.CancelProbe()
 export const flushConfig = () =>
   call("Flush config", () => EngineService.FlushConfig());
 
+// FIX(ui): zero stats counters without engine restart.
+export const resetStats = () => call("Reset stats", () => EngineService.ResetStats());
+
+// FIX(perf): batch stats + logs + active in one IPC call.
+export const snapshotAll = (logSince: number) =>
+  call("Snapshot all", () => EngineService.SnapshotAll(logSince));
+
 // FIX(titlebar): window controls for the custom title bar.
 // NOTE: `as any` keeps tsc green before `wails build` regenerates the
 // bindings (new methods get new Call.ByID numbers). After regeneration
@@ -53,7 +60,8 @@ export const flushConfig = () =>
 export const windowMinimise       = () => call("Window minimise",        () => (EngineService as any).WindowMinimise());
 export const windowToggleMaximise = () => call("Window toggle maximise", () => (EngineService as any).WindowToggleMaximise());
 export const windowClose          = () => call("Window close",           () => (EngineService as any).WindowClose());
-export const isMaximised          = () => call("Window is maximised",    () => (EngineService as any).IsMaximised() as Promise<boolean>);
+// FIX(dedup): removed isMaximised export (dup of windowIsMaximised
+// below). TitleBar already uses windowIsMaximised; no callers existed.
 // FIX(#1): manual-drag title bar bindings (frameless window).
 export const windowStartDrag      = () => call("Window start drag",      () => (EngineService as any).WindowStartDrag());
 export const windowIsMaximised    = () => call("Window is maximised",    () => (EngineService as any).WindowIsMaximised() as Promise<boolean>);

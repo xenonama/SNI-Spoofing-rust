@@ -117,17 +117,18 @@ export function IsAdmin(): $CancellablePromise<boolean> {
 }
 
 /**
- * FIX(titlebar): maximise-state probe for the React TitleBar icon.
- */
-export function IsMaximised(): $CancellablePromise<boolean> {
-    return $Call.ByID(439609928);
-}
-
-/**
  * FIX(A3): backend liveness probe for the UI resync tick.
  */
 export function IsRunning(): $CancellablePromise<boolean> {
     return $Call.ByID(2596871714);
+}
+
+/**
+ * FIX(ui): zero the stats counters (Active, Total, OK, Fail,
+ * Up, Down, boards) without touching the running engine.
+ */
+export function ResetStats(): $CancellablePromise<string> {
+    return $Call.ByID(409054981);
 }
 
 export function RunProbeEndpoints(endpointsJSON: string): $CancellablePromise<string> {
@@ -152,6 +153,13 @@ export function SelfTest(configPath: string): $CancellablePromise<string> {
  */
 export function SetTrayEnabled(enabled: boolean): $CancellablePromise<void> {
     return $Call.ByID(2988867814, enabled);
+}
+
+/**
+ * FIX(perf): single-call snapshot for the 1Hz poller.
+ */
+export function SnapshotAll(logSince: number): $CancellablePromise<string> {
+    return $Call.ByID(2257748210, logSince);
 }
 
 /**
@@ -180,15 +188,6 @@ export function StopFromTray(): $CancellablePromise<void> {
 }
 
 /**
- * FIX(tray-rewrite): split runtime vs persisted probes so the frontend
- * can reconcile without flicker. TrayIsEnabled (legacy name) returns the
- * runtime state; TrayPersistedEnabled returns the on-disk value.
- */
-export function TrayIsEnabled(): $CancellablePromise<boolean> {
-    return $Call.ByID(2235902908);
-}
-
-/**
  * TrayPersistedEnabled reads the on-disk TRAY_ENABLED value (tolerant
  * coercion, defaults true). Used by Reload/Reset to re-apply only when
  * disk and runtime disagree.
@@ -198,7 +197,9 @@ export function TrayPersistedEnabled(): $CancellablePromise<boolean> {
 }
 
 /**
- * TrayRuntimeActive is the explicit runtime probe (tray exists right now).
+ * FIX(dedup): TrayIsEnabled (legacy duplicate of the probe below)
+ * was removed; this is the single runtime probe. TrayPersistedEnabled
+ * reads the on-disk value instead.
  */
 export function TrayRuntimeActive(): $CancellablePromise<boolean> {
     return $Call.ByID(1904414495);
@@ -218,7 +219,8 @@ export function WindowClose(): $CancellablePromise<void> {
 }
 
 /**
- * FIX(#1): canonical maximise-state probe for the manual-drag TitleBar.
+ * FIX(dedup): canonical maximise-state probe. The old IsMaximised
+ * wrapper was removed; this is the single source of truth.
  */
 export function WindowIsMaximised(): $CancellablePromise<boolean> {
     return $Call.ByID(802863560);

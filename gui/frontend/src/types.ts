@@ -68,6 +68,14 @@ export interface SniProbeResult {
   error: string | null;
 }
 
+// FIX(layout): Ranked scoreboard entry for Top methods mini-list.
+export interface Ranked {
+  key: string;
+  ok: number;
+  fail: number;
+  rate: number;
+}
+
 // IMPROVE(U5): one live relay session from sni_get_active_connections().
 export interface ActiveConn {
   local_port: number;

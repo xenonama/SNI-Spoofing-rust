@@ -7,6 +7,7 @@ import {
   type ActiveConn,
   type AppConfig,
   type ProbeResult,
+  type Ranked,
   type SniProbeResult,
   type SortDir,
   type TableSortKey,
@@ -57,6 +58,14 @@ interface AppState {
   epFilter: string;
   sniSort: { key: TableSortKey; dir: SortDir };
   sniFilter: string;
+  // FIX(compact): compact layout flag — persisted in localStorage.
+  compactMode: boolean;
+  // FIX(design): sidebar collapsed state — persisted in localStorage.
+  sidebarCollapsed: boolean;
+  // FIX(layout): top methods from scoreboard for Best section mini-list.
+  topMethods: Ranked[];
+  // FIX(perf): offset for incremental log fetch in refreshAll.
+  logOffset: number;
   actions: {
     setPage: (p: number) => void;
     setConfig: (c: AppConfig) => void;
@@ -71,6 +80,16 @@ interface AppState {
     setEpFilter: (f: string) => void;
     setSniSort: (key: TableSortKey) => void;
     setSniFilter: (f: string) => void;
+    // FIX(compact): toggle compact layout.
+    setCompactMode: (v: boolean) => void;
+    // FIX(design): toggle sidebar collapsed.
+    setSidebarCollapsed: (v: boolean) => void;
+    // FIX(layout): flip sidebarCollapsed with persistence.
+    toggleSidebar: () => void;
+    // FIX(perf): cancel debounce and save immediately.
+    flushConfigNow: () => Promise<void>;
+    // FIX(ui): zero stats counters without engine restart.
+    resetStats: () => Promise<void>;
     start: () => Promise<void>;
     stop: () => Promise<void>;
     save: () => Promise<void>;
@@ -78,6 +97,8 @@ interface AppState {
     refreshStats: () => Promise<void>;
     refreshLogs: () => Promise<void>;
     refreshActive: () => Promise<void>;
+    // FIX(perf): batch stats + logs + active in one IPC call.
+    refreshAll: () => Promise<void>;
     // FIX(A3): slow-cadence liveness resync against the backend.
     refreshAlive: () => Promise<void>;
     clearLogs: () => Promise<void>;
@@ -85,6 +106,10 @@ interface AppState {
     runProbeEndpoints: () => Promise<void>;
     runProbeSnis: () => Promise<void>;
     useFastest: () => Promise<void>;
+    // FIX(tools): clear probe results
+    clearProbeResults: () => void;
+    // FIX(tools): reorder FAKE_SNIS to put top N fastest first
+    useTopSnis: (count: number) => Promise<void>;
   };
 }
 
@@ -134,10 +159,14 @@ async function unwrapCall(p: Promise<unknown>): Promise<any> {
 // nothing changed so idle ticks cause no re-render (no coil whine, <3% CPU).
 let lastStatsSig = "";
 let lastLogSig = "";
-// FIX(persist): no debounce timer — every setConfig persists
-// immediately (the Rust side does an atomic tmp+rename write).
-// (Removed the FIX(#4) autoSaveTimer: debouncing let an immediate
-// exit cancel the pending save.)
+// FIX(perf): signature of the last applied active-connections list.
+// refreshAll() rebuilds the array from JSON every tick, so an
+// unconditional set() re-rendered the table + BypassPage section at
+// 1Hz even with the engine stopped (new ref, same content).
+let lastActiveSig = "";
+// FIX(perf): debounce config saves so typing in a textarea
+// does not write to disk on every keystroke.
+let configSaveTimer: number | null = null;
 // FIX(B7): last tick wall-clock for the measured poll-rate EMA.
 let lastTickAt = 0;
 
@@ -174,6 +203,18 @@ export const useAppStore = create<AppState>((set, get) => ({
   epFilter: "",
   sniSort: { key: "latency", dir: null },
   sniFilter: "",
+  // FIX(compact): compact layout flag — persisted in localStorage.
+  compactMode: (() => {
+    try { return localStorage.getItem("sni.compactMode") === "1"; } catch { return false; }
+  })(),
+  // FIX(design): sidebar collapsed flag — persisted in localStorage.
+  sidebarCollapsed: (() => {
+    try { return localStorage.getItem("sni.sidebarCollapsed") === "1"; } catch { return false; }
+  })(),
+  // FIX(layout): top methods initial empty
+  topMethods: [],
+  // FIX(perf): incremental log offset initial 0
+  logOffset: 0,
   actions: {
     setPage: (p) => set({ page: p }),
     setConfig: (c) => {
@@ -188,12 +229,16 @@ export const useAppStore = create<AppState>((set, get) => ({
       // disk write; the toggle resyncs the store afterwards with the
       // authoritative value, so no edit is lost.
       if (get().trayBusy) return;
-      // FIX(persist): immediate persistence on every change.
-      // The Rust side does an atomic tmp+rename write; this is
-      // fast enough that debouncing is unnecessary complexity.
-      api.configSave(JSON.stringify(c)).catch((e) =>
-        console.error("[autosave] config save failed:", e)
-      );
+      // FIX(perf): debounce config saves so typing in a textarea
+      // does not write to disk on every keystroke.
+      if (configSaveTimer !== null) window.clearTimeout(configSaveTimer);
+      configSaveTimer = window.setTimeout(() => {
+        configSaveTimer = null;
+        const latest = get().config;
+        api.configSave(JSON.stringify(latest)).catch((e) =>
+          console.error("[autosave] config save failed:", e)
+        );
+      }, 400);
     },
     setTrayBusy: (b) => {
       set({ trayBusy: b });
@@ -202,6 +247,58 @@ export const useAppStore = create<AppState>((set, get) => ({
     // toggle to resync from disk after Go owns the save (see BypassPage).
     setConfigLocal: (c) => {
       set({ config: c });
+    },
+    // FIX(compact): toggle compact layout — persisted in localStorage.
+    setCompactMode: (v: boolean) => {
+      try { localStorage.setItem("sni.compactMode", v ? "1" : "0"); } catch {}
+      set({ compactMode: v });
+    },
+    // FIX(design): toggle sidebar collapsed — persisted in localStorage.
+    setSidebarCollapsed: (v: boolean) => {
+      try { localStorage.setItem("sni.sidebarCollapsed", v ? "1" : "0"); } catch {}
+      set({ sidebarCollapsed: v });
+    },
+    // FIX(layout): flip sidebarCollapsed with persistence.
+    toggleSidebar: () => {
+      const next = !get().sidebarCollapsed;
+      try { localStorage.setItem("sni.sidebarCollapsed", next ? "1" : "0"); } catch {}
+      set({ sidebarCollapsed: next });
+    },
+    // FIX(perf): cancel debounce and save immediately.
+    flushConfigNow: async () => {
+      if (configSaveTimer !== null) {
+        window.clearTimeout(configSaveTimer);
+        configSaveTimer = null;
+      }
+      const c = get().config;
+      try {
+        await api.configSave(JSON.stringify(c));
+      } catch (e) {
+        console.error("[flushConfigNow] failed:", e);
+      }
+    },
+    // FIX(ui): zero stats counters without engine restart.
+    resetStats: async () => {
+      try {
+        await api.resetStats();
+        // Clear local derived state so the UI snapshots to zero.
+        lastStatsSig = "";
+        set({
+          active: 0,
+          total: 0,
+          ok: 0,
+          fail: 0,
+          successRate: 0,
+          bestEndpoint: "",
+          bestMethod: "",
+          upBytes: 0,
+          downBytes: 0,
+          lastUpdated: "Last updated —",
+          topMethods: [],
+        });
+      } catch (e) {
+        console.error("[resetStats] failed:", e);
+      }
     },
     // IMPROVE(U3): click cycles asc → desc → none (unsorted).
     setEpSort: (key) =>
@@ -235,6 +332,9 @@ export const useAppStore = create<AppState>((set, get) => ({
     stop: async () => {
       await unwrapCall(api.stopEngine() as Promise<unknown>);
       lastStatsSig = "";
+      // FIX(perf): keep the active-connections signature in sync with
+      // the cleared list so the next refreshAll tick stays silent.
+      lastActiveSig = "0";
       // FIX(A5): clear derived scoreboard state so no stale Best/rate
       // lingers after Stop; FIX(B1): release the uptime anchor.
       set({
@@ -251,6 +351,7 @@ export const useAppStore = create<AppState>((set, get) => ({
         lastUpdated: "Last updated —",
         activeConns: [],
         engineStartedAt: null,
+        topMethods: [],
       });
     },
     save: async () => {
@@ -332,6 +433,8 @@ export const useAppStore = create<AppState>((set, get) => ({
           upBytes: snap.up_bytes ?? 0,
           downBytes: snap.down_bytes ?? 0,
           lastUpdated: "Last updated just now",
+          // FIX(layout): expose top methods for Best section mini-list
+          topMethods: (snap.methods as Ranked[]) ?? [],
         });
       } catch {
         // Backend unavailable — leave last values in place (no layout shift).
@@ -368,6 +471,74 @@ export const useAppStore = create<AppState>((set, get) => ({
         // ignore — table keeps last snapshot
       }
     },
+    // FIX(perf): batch stats + logs + active in one IPC call.
+    // Replaces 3 separate FFI round-trips in the main loop.
+    refreshAll: async () => {
+      try {
+        const raw = await unwrapCall(api.snapshotAll(get().logOffset));
+        const snap = typeof raw === "string" ? JSON.parse(raw) : raw;
+        if (!snap || snap.ok === false) return;
+        const s = snap.stats ?? {};
+        const logs = Array.isArray(snap.logs) ? snap.logs.map(String) : [];
+        const active = Array.isArray(snap.active) ? snap.active : [];
+        // FIX(B7): measured poll-rate EMA kept for the header badge.
+        const nowMs = Date.now();
+        if (lastTickAt > 0) {
+          const dt = (nowMs - lastTickAt) / 1000;
+          if (dt > 0 && dt < 10) {
+            const hz = 1 / dt;
+            const prev = get().pollHz;
+            const next = prev <= 0 ? hz : prev * 0.8 + hz * 0.2;
+            if (Math.abs(next - prev) > 0.05) set({ pollHz: next });
+          }
+        }
+        lastTickAt = nowMs;
+        const sig = [
+          s.active, s.total, s.success, s.failed,
+          s.success_rate, s.best_endpoint, s.best_method,
+          s.up_bytes, s.down_bytes,
+        ].join("|");
+        if (sig !== lastStatsSig) {
+          lastStatsSig = sig;
+          set({
+            active: s.active ?? 0,
+            total: s.total ?? 0,
+            ok: s.success ?? 0,
+            fail: s.failed ?? 0,
+            successRate: s.success_rate ?? 0,
+            bestEndpoint: s.best_endpoint ?? "",
+            bestMethod: s.best_method ?? "",
+            upBytes: s.up_bytes ?? 0,
+            downBytes: s.down_bytes ?? 0,
+            lastUpdated: "Last updated just now",
+            // FIX(layout): keep Top methods mini-list in sync.
+            topMethods: (s.methods as Ranked[]) ?? [],
+          });
+        }
+        if (logs.length > 0) {
+          set((state) => {
+            const merged = [...state.logs, ...logs].slice(-2000);
+            lastLogSig = `${merged.length}|${merged[merged.length - 1] ?? ""}`;
+            return { logs: merged };
+          });
+        }
+        // FIX(perf): skip the store update when the connection list
+        // is unchanged — otherwise every tick hands out a new array
+        // ref and re-renders the table even with the engine stopped.
+        // uptime_secs is part of the sig so the live Uptime column
+        // keeps ticking while running.
+        const activeSig = active.length === 0
+          ? "0"
+          : active.map((c: any) => `${c.local_port}|${c.remote}|${c.method}|${c.uptime_secs}`).join(",");
+        const nextOffset = snap.log_offset ?? get().logOffset;
+        if (activeSig !== lastActiveSig || nextOffset !== get().logOffset) {
+          lastActiveSig = activeSig;
+          set({ activeConns: active, logOffset: nextOffset });
+        }
+      } catch (e) {
+        console.error("[refreshAll] failed:", e);
+      }
+    },
     // FIX(A3): slow-cadence liveness resync — if the backend reports the
     // engine gone while the UI thinks it runs, drop to idle + notice
     // instead of showing a stuck "running" state.
@@ -377,6 +548,8 @@ export const useAppStore = create<AppState>((set, get) => ({
         const alive = (await api.isEngineAlive()) as unknown as boolean;
         if (!alive) {
           lastStatsSig = "";
+          // FIX(perf): keep the active-connections signature in sync.
+          lastActiveSig = "0";
           set({
             running: false,
             active: 0,
@@ -391,6 +564,7 @@ export const useAppStore = create<AppState>((set, get) => ({
             lastUpdated: "Last updated —",
             activeConns: [],
             engineStartedAt: null,
+            topMethods: [],
             notice: "Engine stopped unexpectedly",
           });
         }
@@ -462,6 +636,22 @@ export const useAppStore = create<AppState>((set, get) => ({
         cfg.ENDPOINTS = [{ ip, port: parseInt(portStr, 10) || 443 }];
         set({ config: cfg });
       }
+    },
+    // FIX(tools): clear both probe result tables
+    clearProbeResults: () => {
+      set({ probeResults: [], sniResults: [] });
+    },
+    // FIX(tools): reorder FAKE_SNIS to put top N fastest first
+    useTopSnis: async (count: number) => {
+      const rows = get().sniResults.slice(0, count);
+      if (rows.length === 0) return;
+      const cfg = { ...get().config };
+      const newSnis = rows.map((r) => r.sni);
+      // keep the rest of the original list
+      const rest = cfg.FAKE_SNIS.filter((s) => !newSnis.includes(s));
+      cfg.FAKE_SNIS = [...newSnis, ...rest].slice(0, 200);
+      set({ config: cfg });
+      await get().actions.flushConfigNow();
     },
   },
 }));

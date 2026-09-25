@@ -2,9 +2,8 @@ import { useEffect, useRef } from "react";
 import { useAppStore } from "./stores/appStore";
 // FIX(config-persist): flush-on-hide needs the save binding.
 import * as api from "./api";
-// FIX(titlebar): custom title bar replaces the native one.
+// FIX(design): TitleBar now owns status pill, Sidebar owns system stats.
 import TitleBar from "./components/TitleBar";
-import Header from "./components/Header";
 import Sidebar from "./components/Sidebar";
 import Console from "./components/Console";
 import ConfirmModal from "./components/ConfirmModal";
@@ -121,9 +120,6 @@ function Notice() {
 
 export default function App() {
   const page = useAppStore((s) => s.page);
-  // FIX(config-race): gate the UI until the initial config load settles
-  // so no user edit can happen before load() finishes and be overwritten.
-  const loaded = useAppStore((s) => s.loaded);
   // FIX(B8): guard against React StrictMode double-mount running the
   // startup effect twice (load + duplicate pollers) in dev.
   const mounted = useRef(false);
@@ -171,37 +167,126 @@ export default function App() {
     };
   }, []);
 
+  // FIX(perf): adaptive polling. Stops when hidden, slows down
+  // when idle, snaps back when activity returns.
   useEffect(() => {
     if (mounted.current) return;
     mounted.current = true;
+
     const st = useAppStore.getState();
-    // FIX(tray-persist): startup evidence — log the on-disk tray value once
-    // load() settles, so toggle-persistence bugs are diagnosable.
     st.actions.load().finally(() => {
-      console.log("[startup] TRAY_ENABLED on disk =",
-        useAppStore.getState().config.TRAY_ENABLED);
+      console.log("[startup] TRAY_ENABLED on disk =", useAppStore.getState().config.TRAY_ENABLED);
     });
-    let ticks = 0;
-    const interval = setInterval(() => {
+
+    // FIX(perf): battery-aware polling. Doubles intervals when
+    // on battery to extend runtime.
+    let onBattery = false;
+    const refreshBatteryState = async () => {
+      try {
+        // @ts-ignore: experimental API
+        const b: any = await navigator.getBattery?.();
+        if (b) {
+          onBattery = !b.charging;
+        }
+      } catch {
+        onBattery = false;
+      }
+    };
+    void refreshBatteryState();
+    // Recheck every 30s
+    const batteryTimer = window.setInterval(refreshBatteryState, 30000);
+
+    let timerId: number | null = null;
+    let currentInterval = 1000; // ms
+    let lastStatSig = "";
+    let idleStreak = 0;         // how many ticks with no change
+    let tickCount = 0;
+
+    const scheduleNext = () => {
+      if (timerId !== null) window.clearTimeout(timerId);
+      timerId = window.setTimeout(tick, currentInterval);
+    };
+
+    const tick = async () => {
+      if (document.visibilityState !== "visible") {
+        // Paused — don't reschedule.
+        timerId = null;
+        return;
+      }
+
       const s = useAppStore.getState();
-      // FIX(B5): single interval cleared on unmount; no listener leaks
-      // (api.ts event helpers return unsubscribe functions).
-      s.actions.refreshStats();
-      s.actions.refreshLogs();
-      s.actions.refreshActive();
-      // FIX(A3): liveness resync at ~1/5 cadence (cheap boolean FFI call).
-      ticks += 1;
-      if (ticks % 5 === 0) s.actions.refreshAlive();
-    }, 1000);
+      // FIX(perf): single IPC round-trip instead of 3 separate calls.
+      await s.actions.refreshAll();
+      tickCount += 1;
+      if (tickCount % 5 === 0) s.actions.refreshAlive();
+
+      // Adaptive: compare signature
+      const after = useAppStore.getState();
+      const sig = `${after.active}|${after.total}|${after.ok}|${after.fail}`;
+      if (sig === lastStatSig) {
+        idleStreak += 1;
+      } else {
+        idleStreak = 0;
+        lastStatSig = sig;
+      }
+
+      // Choose next interval based on idle streak
+      let next = 1000;
+      if (idleStreak >= 300) next = 30000;     // 5 min idle -> 30s
+      else if (idleStreak >= 120) next = 10000; // 2 min idle -> 10s
+      else if (idleStreak >= 30) next = 3000;   // 30s idle -> 3s
+
+      // FIX(perf): battery-aware multiplier
+      if (onBattery) {
+        next = Math.min(next * 2, 60000);
+      }
+
+      // FIX(perf): engine stopped → stats/active are frozen, only log
+      // lines can change (user actions). Floor at 2s so an idle
+      // stopped app costs ~1 tiny IPC per 2s instead of 1Hz.
+      if (!after.running) {
+        next = Math.max(next, 2000);
+      }
+
+      if (next !== currentInterval) {
+        currentInterval = next;
+        console.log(`[poll] adaptive rate -> ${next}ms (idle ${idleStreak})`);
+      }
+
+      scheduleNext();
+    };
+
+    const onVis = () => {
+      if (document.visibilityState === "visible") {
+        // Snap back to fast polling and refresh immediately.
+        currentInterval = 1000;
+        idleStreak = 0;
+        const s = useAppStore.getState();
+        // FIX(perf): single IPC round-trip instead of 3 separate calls.
+        s.actions.refreshAll();
+        scheduleNext();
+      } else {
+        // Pause.
+        if (timerId !== null) {
+          window.clearTimeout(timerId);
+          timerId = null;
+        }
+      }
+    };
+
+    document.addEventListener("visibilitychange", onVis);
+    scheduleNext();
+
     return () => {
-      clearInterval(interval);
+      document.removeEventListener("visibilitychange", onVis);
+      window.clearInterval(batteryTimer);
+      if (timerId !== null) window.clearTimeout(timerId);
       mounted.current = false;
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // FIX(config-race): loading gate — disable the UI until load() settles
-  // so no user edit can race the initial config load.
+  // FIX(design): loading gate — keep simple.
+  const loaded = useAppStore((s) => s.loaded);
   if (!loaded) {
     return (
       <div className="flex items-center justify-center h-screen bg-bg text-white">
@@ -210,18 +295,19 @@ export default function App() {
     );
   }
 
+  // FIX(design): new layout — TitleBar + Sidebar + centered content + Console
   return (
-    <div className="flex flex-col h-full bg-bg">
-      {/* FIX(titlebar): custom title bar replaces the native one. */}
+    <div className="flex flex-col h-full bg-bg text-white">
       <TitleBar />
-      <Header />
       <div className="flex flex-1 min-h-0">
         <Sidebar />
-        <main className="flex-1 min-w-0 flex flex-col">
-          <div className="flex-1 min-h-0 overflow-y-auto p-6">
-            {page === 0 && <BypassPage />}
-            {page === 1 && <ProxyPage />}
-            {page === 2 && <ToolsPage />}
+        <main className="flex-1 min-w-0 flex flex-col bg-bg">
+          <div className="flex-1 min-h-0 overflow-y-auto">
+            <div className="max-w-[1200px] mx-auto px-6 py-5">
+              {page === 0 && <BypassPage />}
+              {page === 1 && <ProxyPage />}
+              {page === 2 && <ToolsPage />}
+            </div>
           </div>
           <Console />
         </main>

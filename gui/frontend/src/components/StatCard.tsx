@@ -1,3 +1,4 @@
+// FIX(design): simplified StatCard — mono value, tighter card, no flash animation.
 import { memo } from "react";
 
 interface Props {
@@ -16,17 +17,16 @@ const ACCENT_CLASS: Record<string, string> = {
   muted: "text-white",
 };
 
-// IMPROVE(U6): memoized — the 1Hz stats tick re-renders only changed cards.
-export default memo(function StatCard({ label, value, extra, accent = "muted", flashKey }: Props) {
+export default memo(function StatCard({ label, value, extra, accent = "muted" }: Props) {
   return (
-    <div className="card !p-4 min-h-[96px] flex flex-col justify-between">
-      <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-muted">
+    <div className="rounded-lg bg-[#0F1319] border border-[#1A1F28] px-4 py-3">
+      <div className="text-[10px] font-semibold uppercase tracking-wider text-[#5C6575] mb-1">
         {label}
       </div>
-      <div key={String(flashKey ?? value)} className={`kpi-value flash ${ACCENT_CLASS[accent]} truncate`}>
+      <div className={`text-2xl font-mono font-semibold tabular-nums truncate ${ACCENT_CLASS[accent]}`}>
         {value}
       </div>
-      {extra && <div className="text-xs text-faint truncate">{extra}</div>}
+      {extra && <div className="text-[10px] text-[#5C6575] mt-0.5 truncate">{extra}</div>}
     </div>
   );
 });

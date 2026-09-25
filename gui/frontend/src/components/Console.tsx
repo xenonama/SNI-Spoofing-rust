@@ -1,11 +1,13 @@
+// FIX(design): collapsible bottom panel — header always visible, body toggles 0↔200px.
 import { memo, useEffect, useMemo, useRef, useState } from "react";
 import { useAppStore } from "../stores/appStore";
+import { ChevronDown, ChevronUp } from "lucide-react";
 
 type Filter = 0 | 1 | 2 | 3; // all | info | warn | error
 
 // FIX(B10/U6): hard cap on rendered lines — the store buffer stays at 2000
-// (Rust side evicts FIFO) but only the visible window renders.
-const RENDER_CAP = 500;
+// FIX(perf): bumped to 2000 — contentVisibility handles off-screen cost.
+const RENDER_CAP = 2000;
 
 function lineKind(line: string): "info" | "warn" | "err" | "ok" {
   if (line.includes("[ERR ]")) return "err";
@@ -24,7 +26,16 @@ const KIND_CLASS: Record<string, string> = {
 // IMPROVE(U6): memoized line — re-renders are O(changed), not O(all).
 const LogLine = memo(function LogLine({ line }: { line: string }) {
   return (
-    <div className={`${KIND_CLASS[lineKind(line)]} whitespace-pre-wrap break-all`}>
+    <div
+      className={`${KIND_CLASS[lineKind(line)]} whitespace-pre-wrap break-all`}
+      style={{
+        // FIX(perf): let the browser skip layout/paint for
+        // lines outside the viewport. Works in WebView2
+        // (Chromium). Zero JS overhead.
+        contentVisibility: "auto",
+        containIntrinsicSize: "auto 20px",
+      } as React.CSSProperties}
+    >
       {line}
     </div>
   );
@@ -37,7 +48,8 @@ export default function Console() {
   const [filter, setFilter] = useState<Filter>(0);
   const [search, setSearch] = useState("");
   const [follow, setFollow] = useState(true);
-  const [height, setHeight] = useState(180);
+  const [collapsed, setCollapsed] = useState(true);
+  const [height, setHeight] = useState(200);
   const bodyRef = useRef<HTMLDivElement>(null);
   const dragRef = useRef<{ startY: number; startH: number } | null>(null);
 
@@ -54,12 +66,13 @@ export default function Console() {
   }, [logs, filter, search]);
 
   useEffect(() => {
-    if (follow && bodyRef.current) {
+    if (follow && bodyRef.current && !collapsed) {
       bodyRef.current.scrollTop = bodyRef.current.scrollHeight;
     }
-  }, [shown, follow]);
+  }, [shown, follow, collapsed]);
 
   const onDragStart = (e: React.MouseEvent) => {
+    if (collapsed) return;
     dragRef.current = { startY: e.clientY, startH: height };
     const onMove = (ev: MouseEvent) => {
       if (!dragRef.current) return;
@@ -83,14 +96,16 @@ export default function Console() {
   ];
 
   return (
-    <section className="shrink-0 border-t border-card-edge bg-surface">
+    <section className="shrink-0 border-t border-[#1A1F28] bg-[#0F1319]">
       <div
         onMouseDown={onDragStart}
         className="h-1.5 cursor-ns-resize hover:bg-accent/30 active:bg-accent/50 transition-colors"
         title="Drag to resize console"
       />
-      <div className="flex items-center gap-2 px-4 py-2 flex-wrap">
-        <span className="text-[11px] font-semibold uppercase tracking-[0.18em] text-accent">
+      {/* FIX(design): 32px header with collapse toggle */}
+      <div className="flex items-center gap-2 px-4 h-8">
+        {/* FIX(ui): no chevron prefix here — right-side button is the single toggle. */}
+        <span className="text-[11px] font-semibold uppercase tracking-[0.15em] text-[#5C6575]">
           Live console ({shown.length})
         </span>
         <div className="flex gap-1 ml-2">
@@ -124,27 +139,35 @@ export default function Console() {
           </label>
           <button
             onClick={() => clearLogs()}
-            className="px-3 py-1.5 rounded-md text-xs font-semibold text-white border border-card-edge hover:bg-white/5 active:bg-white/10 transition-colors focus:outline-none focus:ring-2 focus:ring-accent/60"
+            className="px-3 py-1.5 rounded-md text-xs font-semibold text-white border border-white/10 hover:bg-white/5 active:bg-white/10 transition-colors focus:outline-none focus:ring-2 focus:ring-accent/60"
           >
             Clear
           </button>
           <button
             onClick={() => exportLogs()}
-            className="px-3 py-1.5 rounded-md text-xs font-semibold text-white border border-card-edge hover:bg-white/5 active:bg-white/10 transition-colors focus:outline-none focus:ring-2 focus:ring-accent/60"
+            className="px-3 py-1.5 rounded-md text-xs font-semibold text-white border border-white/10 hover:bg-white/5 active:bg-white/10 transition-colors focus:outline-none focus:ring-2 focus:ring-accent/60"
           >
             Export
+          </button>
+          <button
+            onClick={() => setCollapsed(!collapsed)}
+            className="w-7 h-7 flex items-center justify-center rounded-md hover:bg-white/5 text-muted hover:text-white transition-colors focus:outline-none"
+            title={collapsed ? "Expand console" : "Collapse console"}
+          >
+            {collapsed ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
           </button>
         </div>
       </div>
       <div
         ref={bodyRef}
-        style={{ height }}
-        className="overflow-y-auto px-4 pb-3 font-mono text-xs leading-relaxed"
+        style={{ height: collapsed ? 0 : height }}
+        className="overflow-y-auto px-4 pb-3 font-mono text-xs leading-relaxed transition-all duration-200"
       >
-        {shown.slice(-RENDER_CAP).map((line, i) => (
-          <LogLine key={`${i}-${line.length}`} line={line} />
-        ))}
-        {shown.length === 0 && (
+        {!collapsed &&
+          shown.slice(-RENDER_CAP).map((line, i) => (
+            <LogLine key={`${i}-${line.length}`} line={line} />
+          ))}
+        {!collapsed && shown.length === 0 && (
           <div className="text-faint">No log lines match the current filter.</div>
         )}
       </div>

@@ -1,24 +1,17 @@
+// FIX(layout): title bar without hamburger — toggle lives in the sidebar header.
 // FIX(#1): manual drag + double-click title bar (no WebkitAppRegion CSS).
-// WebView2 swallows mouse events under WebkitAppRegion:'drag', so the
-// bar drives the window through Wails bindings instead:
-//   - single mousedown starts a native drag via windowStartDrag
-//   - two mousedowns within 300ms toggle maximize/restore
-//   - elements marked [data-nodrag] never start a drag.
 import { useEffect, useRef, useState } from "react";
 import { Minus, Square, X, Copy } from "lucide-react";
 import * as api from "../api";
 import appIcon from "../assets/app.png";
+import { useAppStore } from "../stores/appStore";
 
 export default function TitleBar() {
   const [maximised, setMaximised] = useState(false);
   const lastClickRef = useRef<number>(0);
+  const running = useAppStore((s) => s.running);
 
   // FIX(#1): manual drag + double-click detection.
-  // WebView2 swallows mouse events under WebkitAppRegion:'drag',
-  // so we no longer use that CSS. Instead:
-  //   - single click on the bar starts a native window drag
-  //   - two clicks within 300ms toggles maximize/restore
-  //   - clicks on [data-nodrag] elements are ignored
   const onMouseDown = async (e: React.MouseEvent) => {
     if (e.button !== 0) return;
     const target = e.target as HTMLElement;
@@ -29,7 +22,6 @@ export default function TitleBar() {
     lastClickRef.current = now;
 
     if (delta < 300) {
-      // double click
       lastClickRef.current = 0;
       try {
         await api.windowToggleMaximise();
@@ -39,7 +31,6 @@ export default function TitleBar() {
       return;
     }
 
-    // single click → start drag
     try {
       await api.windowStartDrag();
     } catch (err) {
@@ -48,18 +39,26 @@ export default function TitleBar() {
   };
 
   // FIX(#1): poll maximize state so the button icon reflects reality.
+  // FIX(perf): 2s cadence (was 500ms) + skip while hidden — the icon
+  // can only change via user action, so a 2Hz Wails IPC forever was
+  // pure idle waste. State is also refreshed right after the toggle
+  // click (see onMax), so the slower cadence is not noticeable.
   useEffect(() => {
     let alive = true;
     const tick = async () => {
       if (!alive) return;
+      if (document.visibilityState !== "visible") return;
       try {
         const m = await api.windowIsMaximised();
-        setMaximised(!!m);
+        setMaximised((prev) => {
+          const next = !!m;
+          return prev === next ? prev : next;
+        });
       } catch {
-        // ignore — button still works for min/close
+        // ignore
       }
     };
-    const t = window.setInterval(tick, 500);
+    const t = window.setInterval(tick, 2000);
     tick();
     return () => {
       alive = false;
@@ -79,31 +78,43 @@ export default function TitleBar() {
     api.windowMinimise().catch((e) => console.error("[titlebar] minimise failed:", e));
   };
   const onMax = () => {
-    api.windowToggleMaximise().catch((e) => console.error("[titlebar] maximise failed:", e));
+    // FIX(perf): refresh the icon immediately after toggling so the
+    // 2s poller cadence above never shows a stale icon.
+    api.windowToggleMaximise()
+      .then(() => api.windowIsMaximised().then((m) => setMaximised(!!m)).catch(() => {}))
+      .catch((e) => console.error("[titlebar] maximise failed:", e));
   };
   const onClose = () => {
     api.windowClose().catch((e) => console.error("[titlebar] close failed:", e));
   };
 
   return (
+    // FIX(layout): 40px height, bg #0F1319, status pill, no hamburger
     <div
       onMouseDown={onMouseDown}
-      className="flex items-center justify-between h-9 bg-[#181C24] border-b border-[#252B36] select-none shrink-0 cursor-default"
+      className="flex items-center justify-between h-10 bg-[#0F1319] border-b border-[#1A1F28] select-none shrink-0 cursor-default"
     >
       {/* Left: logo + app name (draggable area) */}
       <div className="flex items-center gap-2 px-3 h-full">
-        <img src={appIcon} alt="" className="w-5 h-5" draggable={false} />
-        <span className="text-xs font-semibold text-[#8B95A7] tracking-wide">
-          SNI Spoofer
-        </span>
+        <img src={appIcon} alt="" className="w-[18px] h-[18px] rounded-sm" draggable={false} />
+        <span className="text-[13px] font-medium text-white tracking-tight">SNI Spoofer</span>
       </div>
 
-      {/* Right: window controls — data-nodrag so they never start a drag */}
+      {/* Right: status pill + window controls */}
       <div className="flex items-center h-full">
+        {/* FIX(layout): single status pill — tinted background */}
+        <div
+          className={`hidden sm:flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-medium mr-2 ${
+            running ? "bg-success/10 text-success" : "bg-white/5 text-muted"
+          }`}
+        >
+          <span className={`w-2 h-2 rounded-full ${running ? "bg-success" : "bg-[#5C6575]"}`} />
+          {running ? "running" : "idle"}
+        </div>
         <button
           data-nodrag
           onClick={onMin}
-          className="h-full w-11 flex items-center justify-center text-[#8B95A7] hover:bg-white/5 hover:text-white transition-colors focus:outline-none"
+          className="h-10 w-10 flex items-center justify-center text-muted hover:bg-white/5 hover:text-white transition-colors focus:outline-none"
           title="Minimize"
         >
           <Minus size={14} />
@@ -111,7 +122,7 @@ export default function TitleBar() {
         <button
           data-nodrag
           onClick={onMax}
-          className="h-full w-11 flex items-center justify-center text-[#8B95A7] hover:bg-white/5 hover:text-white transition-colors focus:outline-none"
+          className="h-10 w-10 flex items-center justify-center text-muted hover:bg-white/5 hover:text-white transition-colors focus:outline-none"
           title={maximised ? "Restore" : "Maximize"}
         >
           {maximised ? <Copy size={12} /> : <Square size={12} />}
@@ -119,7 +130,7 @@ export default function TitleBar() {
         <button
           data-nodrag
           onClick={onClose}
-          className="h-full w-11 flex items-center justify-center text-[#8B95A7] hover:bg-[#EF476F] hover:text-white transition-colors focus:outline-none"
+          className="h-10 w-10 flex items-center justify-center text-muted hover:bg-[#EF476F] hover:text-white transition-colors focus:outline-none"
           title="Close"
         >
           <X size={14} />

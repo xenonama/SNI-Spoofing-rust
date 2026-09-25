@@ -1,3 +1,4 @@
+// FIX(design): simplified Button — maps variant to utility classes.
 import type { ButtonHTMLAttributes } from "react";
 
 interface Props extends ButtonHTMLAttributes<HTMLButtonElement> {
@@ -5,7 +6,6 @@ interface Props extends ButtonHTMLAttributes<HTMLButtonElement> {
 }
 
 export default function Button({ variant = "ghost", className = "", ...rest }: Props) {
-  const cls =
-    variant === "primary" ? "btn-primary" : variant === "danger" ? "btn-danger" : "btn-ghost";
+  const cls = variant === "primary" ? "btn-primary" : variant === "danger" ? "btn-danger" : "btn-ghost";
   return <button className={`${cls} ${className}`} {...rest} />;
 }

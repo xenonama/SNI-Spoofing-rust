@@ -156,12 +156,12 @@ pub struct ConnEntry {
     pub id: ConnId,
     pub created_at: Instant,
     pub monitor: AtomicBool,
-    // FIX(stats): `counted` is now redundant for the relay-outcome path
-    // (verdict comes from bytes moved, not the handshake flag). Kept for
-    // compat; allow dead_code so the leftover store(true) never warns.
-    #[allow(dead_code)]
-    pub counted: AtomicBool,
+    // FIX(dedup): dead `counted` flag removed (write-only after the
+    // note_fail cleanup; verdict comes from bytes moved, not a flag).
     pub method: String,
+    // FIX(dedup): `sni` lost its only reader with note_fail; kept as
+    // debug state under allow(dead_code), same as `id` above.
+    #[allow(dead_code)]
     pub sni: String,
     completed: Notify,
     result: parking_lot::Mutex<Option<bool>>,
@@ -173,7 +173,6 @@ impl ConnEntry {
             id,
             created_at: Instant::now(),
             monitor: AtomicBool::new(true),
-            counted: AtomicBool::new(false),
             method,
             sni,
             completed: Notify::new(),
@@ -469,7 +468,6 @@ impl Worker {
         // dashboard stays correct with passthrough threads.
         self.stats.increment_total();
         self.stats.increment_active();
-        entry.counted.store(true, Ordering::Relaxed);
         // FIX: pre-register was a no-op (immediately removed). Just
         // register the real connection id under the actual connected
         // endpoint, which is what the DPI dispatch uses.
@@ -677,24 +675,8 @@ impl Worker {
         None
     }
 
-    /// Failure accounting without double-count (mirrors `note_fail`).
-    // FIX(deadlock): retained for parity/debugging; the concurrent hs_task now
-    // inlines its accounting (plus increment_active compensation), so this is
-    // currently unused — allow dead_code to keep zero warnings.
-    #[allow(dead_code)]
-    async fn note_fail(&self, entry: &ConnEntry, endpoint_key: &str) {
-        self.stats
-            .record_result(endpoint_key, &entry.sni, false, &entry.method);
-        if entry.counted.swap(false, Ordering::Relaxed) {
-            // Engine owns handshake accounting; the DPI path only signals
-            // true/false via complete_handshake and never touches Stats.
-            entry.monitor.store(false, Ordering::Relaxed);
-            self.stats.finish_failed();
-        } else {
-            self.stats.increment_failed();
-        }
-    }
-
+    // FIX(dedup): dead note_fail helper removed (the concurrent hs_task
+    // inlines its own accounting); ConnEntry.counted went with it.
     async fn evict(&self, id: &ConnId) {
         self.conns.lock().await.remove(id);
         // FIX(perf): keep the sync mirror in lockstep.

@@ -44,6 +44,10 @@ var (
 	fnGetActiveConns   func() *byte
 	fnCancelProbe      func()
 	fnSetConfigPath    func(*byte)
+	// FIX(ui): reset stats without engine restart.
+	fnResetStats func() *byte
+	// FIX(perf): batch stats + logs + active in one IPC round-trip.
+	fnSnapshotAll func(uint32) *byte
 
 	configPathOverride string
 	configPathMu       sync.RWMutex
@@ -120,6 +124,16 @@ func loadLib() error {
 		func() {
 			defer func() { _ = recover() }()
 			purego.RegisterLibFunc(&fnSetConfigPath, libHandle, "sni_set_config_path")
+		}()
+		// FIX(ui): reset stats — optional for older DLLs.
+		func() {
+			defer func() { _ = recover() }()
+			purego.RegisterLibFunc(&fnResetStats, libHandle, "sni_reset_stats")
+		}()
+		// FIX(perf): batch snapshot — optional for older DLLs.
+		func() {
+			defer func() { _ = recover() }()
+			purego.RegisterLibFunc(&fnSnapshotAll, libHandle, "sni_snapshot_all")
 		}()
 	})
 	return loadErr
@@ -251,6 +265,25 @@ func rustSetConfigPath(p string) {
 
 // IMPROVE(U5): live relay sessions for the Active Connections view.
 func rustGetActiveConnections() (string, error) { return callNoArg(&fnGetActiveConns) }
+
+// FIX(ui): zero stats counters without engine restart.
+func rustResetStats() (string, error) { return callNoArg(&fnResetStats) }
+
+// FIX(perf): single-call snapshot for the 1Hz poller.
+func rustSnapshotAll(logSince uint32) (string, error) {
+	if err := loadLib(); err != nil {
+		return "", err
+	}
+	if fnSnapshotAll == nil {
+		return "", fmt.Errorf("rust function not loaded")
+	}
+	ptr := fnSnapshotAll(logSince)
+	if ptr == nil {
+		return "", fmt.Errorf("rust returned nil")
+	}
+	defer fnFreeString(ptr)
+	return goString(ptr), nil
+}
 
 // FIX(B4): cooperative probe cancellation for window-close (T3).
 func rustCancelProbe() {

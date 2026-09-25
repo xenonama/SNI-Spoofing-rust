@@ -111,6 +111,21 @@ func main() {
 		Mac: application.MacOptions{
 			ApplicationShouldTerminateAfterLastWindowClosed: true,
 		},
+		// FIX(perf): WebView2 occlusion + memory cap. NOTE: beta.20 has no
+		// WebviewWindowOptions.Windows.WebviewBrowserArguments field — the
+		// correct home is application-level Windows.AdditionalBrowserArgs
+		// (global to all windows, single shared browser environment).
+		Windows: application.WindowsOptions{
+			EnabledFeatures: []string{"CalculateNativeWinOcclusion"},
+		AdditionalBrowserArgs: []string{
+			"--disable-background-timer-throttling=false",
+			`--js-flags=--max-old-space-size=128 --max-semi-space-size=16`,
+			"--renderer-process-limit=1",
+			// FIX(ui): disable the native WebView2 context menu at the
+			// browser-process level so it cannot leak through on inputs.
+			"--disable-features=ContextMenu",
+		},
+		},
 	})
 
 	// FIX(tray-rewrite): manager owns lifecycle; window is created first
@@ -169,6 +184,22 @@ func main() {
 		}
 		event.Cancel()
 		mainWindow.Hide()
+	})
+	// FIX(perf): visibility transitions — JS-side visibilitychange in App.tsx
+	// already pauses polling; occlusion + these logs show hide/show in console.
+	// NOTE: beta.20 has no w.OnWindowHide/OnWindowShow methods; RegisterHook
+	// with events.Common.WindowHide/WindowShow is the available API.
+	mainWindow.RegisterHook(events.Common.WindowHide, func(event *application.WindowEvent) {
+		trayLogInfo("window hidden: WebView2 will be occluded by Windows")
+	})
+	mainWindow.RegisterHook(events.Common.WindowShow, func(event *application.WindowEvent) {
+		trayLogInfo("window shown: WebView2 resumed")
+	})
+	mainWindow.RegisterHook(events.Common.WindowMinimise, func(event *application.WindowEvent) {
+		trayLogInfo("window minimised: WebView2 will be occluded by Windows")
+	})
+	mainWindow.RegisterHook(events.Common.WindowRestore, func(event *application.WindowEvent) {
+		trayLogInfo("window restored: WebView2 resumed")
 	})
 	if err := app.Run(); err != nil {
 		log.Fatal(err)
